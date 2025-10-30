@@ -1,1 +1,3 @@
-backend/gee-service-key.json
+*.json
+*.pkl
+*.db

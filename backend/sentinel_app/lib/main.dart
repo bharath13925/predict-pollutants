@@ -19,9 +19,6 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:fl_chart/fl_chart.dart';
 
-// IMPORT THE HEALTH TIPS FILE
-import 'health_tips_data.dart';
-
 void main() {
   runApp(const AirAwareApp());
 }
@@ -81,19 +78,24 @@ class _AirAwareHomeState extends State<AirAwareHome> {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({'city': city}),
           )
-          .timeout(const Duration(seconds: 60000));
+          .timeout(
+            const Duration(seconds: 60000), // 10 minutes for full analysis
+          );
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
 
         setState(() {
+          // Store all components
           _historicalData = data['historical_data'];
           _trainingResult = data['model_training'];
 
+          // Process current AQI data
           if (data['current_data'] != null) {
             _aqiData = _processAQIData(data['current_data'], city);
           }
 
+          // Store predictions
           if (data['predictions'] != null &&
               data['predictions']['predictions'] != null) {
             _predictions = data['predictions']['predictions'];
@@ -692,39 +694,6 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                               ),
                             ],
                           ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 20),
-
-                      // *** NEW: HEALTH TIPS BUTTON ***
-                      ElevatedButton.icon(
-                        onPressed: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => HealthTipsScreen(
-                                aqiLevel: _aqiData!["overallAQI"]["level"],
-                                worstPollutant:
-                                    _aqiData!["overallAQI"]["worstPollutant"],
-                                predictions: _predictions,
-                              ),
-                            ),
-                          );
-                        },
-                        icon: const Icon(Icons.health_and_safety, size: 24),
-                        label: const Text('View Health Tips & Precautions'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.redAccent,
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 30,
-                            vertical: 18,
-                          ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(15),
-                          ),
-                          elevation: 5,
                         ),
                       ),
 
@@ -1409,6 +1378,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       pm10Spots.add(FlSpot(i.toDouble(), _predictions![i]['pm10']));
     }
 
+    // Calculate min/max for better scaling
     double minPM25 = pm25Spots.map((e) => e.y).reduce((a, b) => a < b ? a : b);
     double maxPM25 = pm25Spots.map((e) => e.y).reduce((a, b) => a > b ? a : b);
     double minY = (minPM25 * 0.8).floorToDouble();
@@ -1452,6 +1422,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
           ),
           const SizedBox(height: 25),
 
+          // PM2.5 Chart
           const Text(
             "PM2.5 Concentration",
             style: TextStyle(
@@ -1533,10 +1504,10 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                       },
                     ),
                   ),
-                  topTitles: const AxisTitles(
+                  topTitles: AxisTitles(
                     sideTitles: SideTitles(showTitles: false),
                   ),
-                  rightTitles: const AxisTitles(
+                  rightTitles: AxisTitles(
                     sideTitles: SideTitles(showTitles: false),
                   ),
                 ),
@@ -1598,6 +1569,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
           ),
           const SizedBox(height: 30),
 
+          // PM10 Chart
           const Text(
             "PM10 Concentration",
             style: TextStyle(
@@ -1668,10 +1640,10 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                       },
                     ),
                   ),
-                  topTitles: const AxisTitles(
+                  topTitles: AxisTitles(
                     sideTitles: SideTitles(showTitles: false),
                   ),
-                  rightTitles: const AxisTitles(
+                  rightTitles: AxisTitles(
                     sideTitles: SideTitles(showTitles: false),
                   ),
                 ),
@@ -1737,441 +1709,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   }
 }
 
-// ============ HEALTH TIPS SCREEN ============
-class HealthTipsScreen extends StatelessWidget {
-  final int aqiLevel;
-  final String worstPollutant;
-  final List<dynamic>? predictions;
-
-  const HealthTipsScreen({
-    super.key,
-    required this.aqiLevel,
-    required this.worstPollutant,
-    this.predictions,
-  });
-
-  String _normalizePollutantName(String name) {
-    String normalized = name
-        .toUpperCase()
-        .replaceAll('₂', '2')
-        .replaceAll('₃', '3')
-        .replaceAll(' ', '');
-
-    if (normalized.contains('PM2.5') || normalized == 'PM25') return 'PM2.5';
-    if (normalized.contains('PM10')) return 'PM10';
-    if (normalized.contains('NO2')) return 'NO2';
-    if (normalized.contains('SO2')) return 'SO2';
-    if (normalized.contains('CO') && !normalized.contains('CO2')) return 'CO';
-    if (normalized.contains('O3')) return 'O3';
-
-    return name;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final generalAdvice = HealthTipsData.getGeneralAdviceByLevel()[aqiLevel];
-    final normalizedPollutant = _normalizePollutantName(worstPollutant);
-    final pollutantInfo = HealthTipsData.pollutantInfo[normalizedPollutant];
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Health Tips & Precautions'),
-        backgroundColor: Colors.teal,
-        elevation: 0,
-      ),
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            colors: [Color(0xFF56CCF2), Color(0xFF2F80ED)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-        ),
-        child: SafeArea(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Overall Status Card
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(20),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
-                        blurRadius: 10,
-                        offset: const Offset(0, 5),
-                      ),
-                    ],
-                  ),
-                  child: Column(
-                    children: [
-                      Text(
-                        '${generalAdvice?.emoji ?? "😊"} Air Quality: ${generalAdvice?.category ?? "Unknown"}',
-                        style: const TextStyle(
-                          fontSize: 24,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.black87,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        generalAdvice?.advice ?? "No advice available",
-                        style: const TextStyle(
-                          fontSize: 16,
-                          color: Colors.black54,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                    ],
-                  ),
-                ),
-
-                const SizedBox(height: 25),
-
-                // Worst Pollutant Information
-                if (pollutantInfo != null) ...[
-                  Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
-                          blurRadius: 10,
-                          offset: const Offset(0, 5),
-                        ),
-                      ],
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Text(
-                              pollutantInfo.emoji,
-                              style: const TextStyle(fontSize: 32),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    'Primary Concern',
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      color: Colors.grey,
-                                    ),
-                                  ),
-                                  Text(
-                                    pollutantInfo.name,
-                                    style: const TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.black87,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 15),
-                        Text(
-                          pollutantInfo.description,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            color: Colors.black54,
-                            height: 1.5,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  const SizedBox(height: 20),
-
-                  // Health Effects
-                  _buildSectionCard(
-                    title: '🫁 Health Effects',
-                    items: pollutantInfo.healthEffects,
-                    color: Colors.red.shade50,
-                  ),
-
-                  const SizedBox(height: 20),
-
-                  // Precautions
-                  _buildSectionCard(
-                    title: '✅ Recommended Precautions',
-                    items: pollutantInfo.precautions,
-                    color: Colors.green.shade50,
-                  ),
-
-                  const SizedBox(height: 20),
-
-                  // Vulnerable Groups
-                  _buildSectionCard(
-                    title: '⚠️ Vulnerable Groups',
-                    items: pollutantInfo.vulnerableGroups,
-                    color: Colors.orange.shade50,
-                  ),
-                ],
-
-                const SizedBox(height: 25),
-
-                // General Actions
-                if (generalAdvice != null)
-                  _buildSectionCard(
-                    title: '📋 General Actions to Take',
-                    items: generalAdvice.actions,
-                    color: Colors.blue.shade50,
-                  ),
-
-                const SizedBox(height: 20),
-
-                // Indoor Air Quality Tips
-                _buildSectionCard(
-                  title: '🏠 Indoor Air Quality Tips',
-                  items: HealthTipsData.getIndoorAirQualityTips(),
-                  color: Colors.purple.shade50,
-                ),
-
-                const SizedBox(height: 20),
-
-                // Dietary Recommendations
-                _buildSectionCard(
-                  title: '🍎 Dietary Recommendations',
-                  items: HealthTipsData.getDietaryRecommendations(),
-                  color: Colors.teal.shade50,
-                ),
-
-                const SizedBox(height: 20),
-
-                // Emergency Contacts
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: Colors.red.shade50,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.red.shade200, width: 2),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(
-                            Icons.phone_in_talk,
-                            color: Colors.red,
-                            size: 28,
-                          ),
-                          SizedBox(width: 10),
-                          Text(
-                            'Emergency Contacts',
-                            style: TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.black87,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 15),
-                      ...HealthTipsData.getEmergencyContacts().map((contact) {
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 5),
-                          child: Text(
-                            contact,
-                            style: const TextStyle(
-                              fontSize: 16,
-                              color: Colors.black87,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                        );
-                      }),
-                    ],
-                  ),
-                ),
-
-                const SizedBox(height: 20),
-
-                // 7-Day Forecast Warning (if available)
-                if (predictions != null && predictions!.isNotEmpty) ...[
-                  Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.shade50,
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: Colors.orange.shade200,
-                        width: 2,
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Row(
-                          children: [
-                            Icon(
-                              Icons.calendar_today,
-                              color: Colors.orange,
-                              size: 28,
-                            ),
-                            SizedBox(width: 10),
-                            Text(
-                              '7-Day Forecast Alert',
-                              style: TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.black87,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 15),
-                        _buildForecastWarnings(),
-                      ],
-                    ),
-                  ),
-                ],
-
-                const SizedBox(height: 30),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSectionCard({
-    required String title,
-    required List<String> items,
-    required Color color,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              color: Colors.black87,
-            ),
-          ),
-          const SizedBox(height: 15),
-          ...items.asMap().entries.map((entry) {
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Container(
-                    margin: const EdgeInsets.only(top: 5, right: 10),
-                    width: 6,
-                    height: 6,
-                    decoration: const BoxDecoration(
-                      color: Colors.black54,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  Expanded(
-                    child: Text(
-                      entry.value,
-                      style: const TextStyle(
-                        fontSize: 14,
-                        color: Colors.black87,
-                        height: 1.5,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildForecastWarnings() {
-    if (predictions == null || predictions!.isEmpty) {
-      return const Text(
-        'No forecast data available',
-        style: TextStyle(color: Colors.black54),
-      );
-    }
-
-    List<Widget> warnings = [];
-    int poorDaysCount = 0;
-
-    for (var pred in predictions!) {
-      double pm25 = pred['pm25'];
-      if (pm25 > 60) {
-        poorDaysCount++;
-      }
-    }
-
-    if (poorDaysCount > 0) {
-      warnings.add(
-        Text(
-          '⚠️ Expected $poorDaysCount day(s) with unhealthy air quality in the next week',
-          style: const TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.bold,
-            color: Colors.black87,
-          ),
-        ),
-      );
-      warnings.add(const SizedBox(height: 10));
-      warnings.add(
-        const Text(
-          'Plan indoor activities for those days. Keep medications handy.',
-          style: TextStyle(fontSize: 14, color: Colors.black54),
-        ),
-      );
-    } else {
-      warnings.add(
-        const Text(
-          '✅ Air quality expected to remain acceptable throughout the week',
-          style: TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.bold,
-            color: Colors.green,
-          ),
-        ),
-      );
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: warnings,
-    );
-  }
-}
-
-// ============ FULL SCREEN MAP VIEW ============
+// FULL SCREEN MAP VIEW
 class FullScreenMapView extends StatelessWidget {
   final Map<String, dynamic> mapTiles;
   final String cityName;
@@ -2361,7 +1899,7 @@ class FullScreenMapView extends StatelessWidget {
                       ],
                     ),
                   );
-                }),
+                }).toList(),
             ],
           ),
         ),
