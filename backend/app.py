@@ -14,19 +14,31 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout 
 from tensorflow.keras.callbacks import EarlyStopping 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
-# --- Google Earth Engine Configuration ---
-SERVICE_ACCOUNT = 'gee-service-account@street-view-videos-with-maps.iam.gserviceaccount.com'
-SERVICE_KEY_FILE = 'gee-service-key.json'
+import os, json, ee
+from dotenv import load_dotenv
 
-try:
-    credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, SERVICE_KEY_FILE)
-    ee.Initialize(credentials)
-    print("✅ Google Earth Engine initialized successfully")
-    GEE_AVAILABLE = True
-except Exception as e:
-    print(f"❌ GEE initialization error: {e}")
-    GEE_AVAILABLE = False
+load_dotenv()
+
+service_key_json = os.getenv("GEE_SERVICE_KEY_JSON")
+GEE_AVAILABLE = False  
+
+if service_key_json:
+    try:
+        service_key_dict = json.loads(service_key_json)
+        credentials = ee.ServiceAccountCredentials(service_key_dict["client_email"], key_data=service_key_json)
+        ee.Initialize(credentials)
+        print("✅ Google Earth Engine initialized successfully")
+        GEE_AVAILABLE = True
+    except Exception as e:
+        print(f"❌ Failed to initialize GEE: {e}")
+else:
+    print("⚠️ Environment variable GEE_SERVICE_KEY_JSON not found")
+
+print(f"GEE Status: {'✅ Available' if GEE_AVAILABLE else '❌ Not Available'}")
+
 
 # --- Flask App Configuration ---
 app = Flask(__name__)
