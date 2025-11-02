@@ -1,5 +1,6 @@
 # Sensitive files
 .env
+gee-service-key.json
 
 # Python cache
 __pycache__/
