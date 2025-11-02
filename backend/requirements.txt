@@ -1,11 +1,8 @@
 flask
-flask-cors
-requests
-geopy
-pytz
-python-dotenv
-openaq
+google-api-python-client
 earthengine-api
+geopy
 pandas
 numpy
 scikit-learn
+tensorflow

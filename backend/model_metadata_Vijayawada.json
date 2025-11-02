@@ -1,0 +1,1 @@
+{"train_loss": 0.007988009601831436, "train_mae": 0.0638589859008789, "test_loss": 0.009058783762156963, "test_mae": 0.07252360880374908, "training_samples": 1092, "test_samples": 273, "trained_at": "2025-11-02T13:06:34.200041", "lookback_days": 90}

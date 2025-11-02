@@ -57,6 +57,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Map<String, dynamic>? _modelInfo;
   Map<String, dynamic>? _historicalData;
   Map<String, dynamic>? _trainingResult;
+  Map<String, dynamic>? _weatherData;
 
   // CHANGE THIS TO YOUR SERVER IP
   final String baseUrl = "http://10.117.36.104:5000/api";
@@ -209,6 +210,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       _modelInfo = null;
       _historicalData = null;
       _trainingResult = null;
+      _weatherData = null;
     });
 
     try {
@@ -232,6 +234,11 @@ class _AirAwareHomeState extends State<AirAwareHome> {
 
           if (data['current_data'] != null) {
             _aqiData = _processAQIData(data['current_data'], city);
+            if (data['current_data']['weather'] != null) {
+              _weatherData = Map<String, dynamic>.from(
+                data['current_data']['weather'],
+              );
+            }
           }
 
           if (data['predictions'] != null &&
@@ -313,6 +320,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       _aqiData = null;
       _predictions = null;
       _modelInfo = null;
+      _weatherData = null;
     });
 
     try {
@@ -342,6 +350,9 @@ class _AirAwareHomeState extends State<AirAwareHome> {
 
         setState(() {
           _aqiData = _processAQIData(data, city);
+          if (data['weather'] != null) {
+            _weatherData = Map<String, dynamic>.from(data['weather']);
+          }
           _loading = false;
         });
       } else {
@@ -952,6 +963,23 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                           ],
                         ),
 
+                      if (_weatherData != null && _weatherData!.isNotEmpty)
+                        Column(
+                          children: [
+                            Text(
+                              "🌤️ Weather Conditions",
+                              style: TextStyle(
+                                fontSize: 16,
+                                color: Colors.white.withOpacity(0.9),
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(height: 15),
+                            _buildWeatherCard(_weatherData!),
+                            const SizedBox(height: 20),
+                          ],
+                        ),
+
                       Text(
                         "📊 Pollutant Measurements",
                         style: TextStyle(
@@ -1153,125 +1181,168 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                       color: Colors.white.withOpacity(0.2),
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child: Builder(
-                      builder: (context) {
-                        // Merge both sources, prioritizing _trainingResult for metrics
-                        final combinedModelInfo = {
-                          'model_type':
-                              _modelInfo?['model_type'] ??
-                              _trainingResult?['model_type'] ??
-                              'LSTM',
-                          'trained_at':
-                              _modelInfo?['trained_at'] ??
-                              _trainingResult?['trained_at'] ??
-                              'Unknown',
-                          'lookback_days':
-                              _modelInfo?['lookback_days'] ??
-                              _trainingResult?['lookback_days'],
-                          'test_mae':
-                              _trainingResult?['test_mae'] ??
-                              _modelInfo?['test_mae'],
-                          'test_loss':
-                              _trainingResult?['test_loss'] ??
-                              _modelInfo?['test_loss'],
-                          'train_mae':
-                              _trainingResult?['train_mae'] ??
-                              _modelInfo?['train_mae'],
-                          'train_loss':
-                              _trainingResult?['train_loss'] ??
-                              _modelInfo?['train_loss'],
-                          'training_samples':
-                              _trainingResult?['training_samples'] ??
-                              _modelInfo?['training_samples'],
-                          'test_samples':
-                              _trainingResult?['test_samples'] ??
-                              _modelInfo?['test_samples'],
-                        };
-
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              "🤖 ML Model Info",
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
-                              ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          "🤖 ML Model Info",
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          "Type: ${_modelInfo?['model_type']?.toString().toUpperCase() ?? _trainingResult?['model_type']?.toString().toUpperCase() ?? 'LSTM'}",
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                        Text(
+                          "Trained: ${_modelInfo?['trained_at'] ?? _trainingResult?['trained_at'] ?? 'Unknown'}",
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                        Text(
+                          "Accuracy: ${_calculateModelAccuracy(_modelInfo ?? _trainingResult)}",
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                        if (_modelInfo?['lookback_days'] != null ||
+                            _trainingResult?['lookback_days'] != null)
+                          Text(
+                            "Lookback: ${_modelInfo?['lookback_days'] ?? _trainingResult?['lookback_days']} days",
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
                             ),
-                            const SizedBox(height: 8),
-                            Text(
-                              "Type: ${combinedModelInfo['model_type'].toString().toUpperCase()}",
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 12,
-                              ),
-                            ),
-                            Text(
-                              "Trained: ${combinedModelInfo['trained_at']}",
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 12,
-                              ),
-                            ),
-                            Text(
-                              "Accuracy: ${_calculateModelAccuracy(combinedModelInfo)}",
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 12,
-                              ),
-                            ),
-                            if (combinedModelInfo['lookback_days'] != null)
-                              Text(
-                                "Lookback: ${combinedModelInfo['lookback_days']} days",
-                                style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 12,
-                                ),
-                              ),
-                            const SizedBox(height: 8),
-                            GestureDetector(
-                              onTap: () {
-                                showDialog(
-                                  context: context,
-                                  builder: (context) => AlertDialog(
-                                    title: const Text(
-                                      'Model Performance Details',
+                          ),
+                        const SizedBox(height: 8),
+                        GestureDetector(
+                          onTap: () {
+                            showDialog(
+                              context: context,
+                              builder: (context) => AlertDialog(
+                                title: const Text('Model Performance Details'),
+                                content: SingleChildScrollView(
+                                  child: Text(
+                                    _getAccuracyDetails(
+                                      _modelInfo ?? _trainingResult,
                                     ),
-                                    content: SingleChildScrollView(
-                                      child: Text(
-                                        _getAccuracyDetails(combinedModelInfo),
-                                        style: const TextStyle(fontSize: 13),
-                                      ),
-                                    ),
-                                    actions: [
-                                      TextButton(
-                                        onPressed: () => Navigator.pop(context),
-                                        child: const Text('Close'),
-                                      ),
-                                    ],
+                                    style: const TextStyle(fontSize: 13),
                                   ),
-                                );
-                              },
-                              child: Text(
-                                "📊 View detailed metrics",
-                                style: TextStyle(
-                                  color: Colors.white.withOpacity(0.8),
-                                  fontSize: 11,
-                                  fontStyle: FontStyle.italic,
-                                  decoration: TextDecoration.underline,
                                 ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context),
+                                    child: const Text('Close'),
+                                  ),
+                                ],
                               ),
+                            );
+                          },
+                          child: Text(
+                            "📊 View detailed metrics",
+                            style: TextStyle(
+                              color: Colors.white.withOpacity(0.8),
+                              fontSize: 11,
+                              fontStyle: FontStyle.italic,
+                              decoration: TextDecoration.underline,
                             ),
-                          ],
-                        );
-                      },
+                          ),
+                        ),
+                      ],
                     ),
                   ),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildWeatherCard(Map<String, dynamic> weatherData) {
+    return Card(
+      color: Colors.white.withOpacity(0.95),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+      margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 15),
+      elevation: 4,
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            if (weatherData['temperature'] != null)
+              _buildWeatherRow(
+                Icons.thermostat,
+                'Temperature',
+                '${_safeGetNumber(weatherData['temperature']).toStringAsFixed(1)}°C',
+                Colors.orange,
+              ),
+            if (weatherData['humidity'] != null)
+              _buildWeatherRow(
+                Icons.water_drop,
+                'Humidity',
+                '${_safeGetNumber(weatherData['humidity']).toStringAsFixed(1)}%',
+                Colors.blue,
+              ),
+            if (weatherData['wind_speed'] != null)
+              _buildWeatherRow(
+                Icons.air,
+                'Wind Speed',
+                '${_safeGetNumber(weatherData['wind_speed']).toStringAsFixed(1)} m/s',
+                Colors.cyan,
+              ),
+            if (weatherData['precipitation'] != null)
+              _buildWeatherRow(
+                Icons.cloud,
+                'Precipitation',
+                '${_safeGetNumber(weatherData['precipitation']).toStringAsFixed(2)} mm',
+                Colors.indigo,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWeatherRow(
+    IconData icon,
+    String label,
+    String value,
+    Color color,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.2),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, color: color, size: 24),
+          ),
+          const SizedBox(width: 15),
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+            ),
+          ),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+        ],
       ),
     );
   }

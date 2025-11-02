@@ -36,8 +36,8 @@ DB_NAME = 'air_quality_gee.db'
 
 # --- Configuration ---
 DATA_LAG_DAYS = 6  # Copernicus and ERA5 have 6-day lag
-DAYS_BACK = 1455  # Adjusted from 730 to account for lag (2 years minus lag)
-LOOKBACK_DAYS = 90  # LSTM lookback period
+DAYS_BACK = 724  # Adjusted from 730 to account for lag (2 years minus lag)
+LOOKBACK_DAYS = 60  # LSTM lookback period
 MODEL_RETRAINING_DAYS = 7
 CHUNK_SIZE = 7  # Collect data in weekly chunks
 
@@ -127,7 +127,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 ).getInfo()
                 if 'absorbing_aerosol_index' in aer_stats and aer_stats['absorbing_aerosol_index'] is not None:
                     pollutant_data['pm25'] = abs(aer_stats['absorbing_aerosol_index']) * 50
-                    print(f"  ✓ PM25: {pollutant_data['pm25']:.2f} ug")
         except Exception as e:
             print(f"  ⚠️ PM2.5 error: {e}")
         
@@ -146,7 +145,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 ).getInfo()
                 if 'tropospheric_NO2_column_number_density' in no2_stats and no2_stats['tropospheric_NO2_column_number_density'] is not None:
                     pollutant_data['no2'] = no2_stats['tropospheric_NO2_column_number_density'] * 46.0055 * 1e6
-                    print(f"  ✓ NO2: {pollutant_data['no2']:.2f} ug")
         except Exception as e:
             print(f"  ⚠️ NO2 error: {e}")
         
@@ -165,7 +163,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 ).getInfo()
                 if 'SO2_column_number_density' in so2_stats and so2_stats['SO2_column_number_density'] is not None:
                     pollutant_data['so2'] = so2_stats['SO2_column_number_density'] * 64.066 * 1e6
-                    print(f"  ✓ SO2: {pollutant_data['so2']:.2f} ug")
         except Exception as e:
             print(f"  ⚠️ SO2 error: {e}")
         
@@ -184,7 +181,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 ).getInfo()
                 if 'CO_column_number_density' in co_stats and co_stats['CO_column_number_density'] is not None:
                     pollutant_data['co'] = co_stats['CO_column_number_density'] * 28.01 * 1e3
-                    print(f"  ✓ CO: {pollutant_data['co']:.2f} ug")
         except Exception as e:
             print(f"  ⚠️ CO error: {e}")
         
@@ -203,7 +199,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 ).getInfo()
                 if 'O3_column_number_density' in o3_stats and o3_stats['O3_column_number_density'] is not None:
                     pollutant_data['o3'] = o3_stats['O3_column_number_density'] * 47.9982 * 1e6
-                    print(f"  ✓ O3: {pollutant_data['o3']:.2f} ug")
         except Exception as e:
             print(f"  ⚠️ O3 error: {e}")
         
@@ -228,7 +223,8 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 ch4_stats = ch4_collection.mean().reduceRegion(
                     reducer=ee.Reducer.mean(),
                     geometry=aoi,
-                    scale=7000
+                    scale=7000,
+                    maxPixels=1e9
                 ).getInfo()
                 
                 if 'CH4_column_volume_mixing_ratio_dry_air' in ch4_stats and ch4_stats['CH4_column_volume_mixing_ratio_dry_air'] is not None:
@@ -242,7 +238,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         # PM10 (estimated from PM2.5 using typical ratio)
         if 'pm25' in pollutant_data:
             pollutant_data['pm10'] = pollutant_data['pm25'] * 1.8
-            print(f"  ✓ PM10: {pollutant_data['pm10']:.2f} ug")
         
         return pollutant_data
         
@@ -1185,7 +1180,7 @@ if __name__ == "__main__":
     print(f"\n📈 CONFIGURATION:")
     print(f"   • Satellite Data Lag: {DATA_LAG_DAYS} days")
     print(f"   • Historical Data Collection: {DAYS_BACK} days (adjusted for lag)")
-    print(f"   • Historical Data Range: ~4 years ago to {DATA_LAG_DAYS} days ago")
+    print(f"   • Historical Data Range: ~2 years ago to {DATA_LAG_DAYS} days ago")
     print(f"   • Model Type: LSTM (Long Short-Term Memory)")
     print(f"   • Model Lookback Period: {LOOKBACK_DAYS} days")
     print(f"   • Data Collection Chunk Size: {CHUNK_SIZE} days")
