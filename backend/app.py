@@ -1028,6 +1028,8 @@ def full_analysis():
     if not city_name:
         return jsonify({"error": "Missing 'city' parameter"}), 400
     
+    city_name = city_name.strip().title()
+    
     print(f"\n🚀 Starting full analysis for {city_name}")
     
     print("\n📊 Step 1: Checking historical data in MongoDB...")
