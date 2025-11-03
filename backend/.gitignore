@@ -1,9 +1,35 @@
-# Sensitive files
+# Environment
 .env
-gee-service-key.json
-backend/gee-service-key.json
+*.env
 
-
-# Python cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Old SQLite files (not needed with MongoDB)
+*.db
+*.sqlite
+*.sqlite3
+
+# Old local model files (not needed with GridFS)
+*.keras
+*.h5
+*.pkl
+model_metadata_*.json
+
+# Temporary files
+/tmp/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
