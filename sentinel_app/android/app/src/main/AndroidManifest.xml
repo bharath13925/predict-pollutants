@@ -6,7 +6,7 @@
 
     <application
         android:usesCleartextTraffic="true"
-        android:label="sentinel_app"
+        android:label="Air Aware"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

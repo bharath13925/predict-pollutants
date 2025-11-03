@@ -32,7 +32,7 @@ class AirAwareApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Air Aware - Complete',
+      title: 'Air Aware',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(primarySwatch: Colors.teal, fontFamily: 'Poppins'),
       home: const AirAwareHome(),
@@ -59,7 +59,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Map<String, dynamic>? _trainingResult;
 
   // CHANGE THIS TO YOUR SERVER IP
-  final String baseUrl = "http://10.117.36.104:5000/api";
+  final String baseUrl = "https://air-quality-api-etwm.onrender.com/api";
 
   /// ✅ COMPREHENSIVE ACCURACY CALCULATION
   /// Based on MAE (Mean Absolute Error), Test Loss, and Model Confidence
@@ -767,13 +767,18 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                                           );
                                         }
                                       },
-                                icon: const Icon(Icons.psychology, size: 20),
-                                label: const Text('Full AI'),
+                                icon: const Icon(Icons.psychology, size: 18),
+                                label: const Text(
+                                  'Generate\nPredictions',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(fontSize: 13, height: 1.1),
+                                ),
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.purple,
                                   foregroundColor: Colors.white,
                                   padding: const EdgeInsets.symmetric(
-                                    vertical: 15,
+                                    vertical: 12,
+                                    horizontal: 8,
                                   ),
                                 ),
                               ),
