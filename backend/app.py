@@ -19,7 +19,6 @@ from pymongo.errors import DuplicateKeyError
 import gridfs
 import tempfile
 import openaq
-from openaq.exceptions import AuthError, BadRequestError
 from datetime import timezone
 
 
@@ -191,13 +190,7 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
             print(f"    ℹ️ PM10 estimated from PM2.5: {result['pm10']:.2f} µg/m³")
         
         return result if result else None
-        
-    except AuthError as e:
-        print(f"    ❌ OpenAQ Auth error: {e}")
-        return None
-    except BadRequestError as e:
-        print(f"    ❌ OpenAQ Bad request: {e}")
-        return None
+    
     except Exception as e:
         print(f"    ❌ OpenAQ error: {e}")
         traceback.print_exc()
