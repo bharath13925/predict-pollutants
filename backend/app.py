@@ -18,6 +18,10 @@ from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 import gridfs
 import tempfile
+import openaq
+from openaq import AuthError, BadRequestError
+from datetime import timezone
+
 
 load_dotenv()
 
@@ -45,6 +49,11 @@ except Exception as e:
     print(f"❌ MongoDB connection failed: {e}")
     raise
 
+# --- OpenAQ Configuration ---
+OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "6f1d18cea1904724d3604e5cd1fa201c6404de8c78401391820d33652983615f")
+openaq_client = openaq.OpenAQ(api_key=OPENAQ_API_KEY)
+print("✅ OpenAQ client initialized")
+
 # --- Google Earth Engine Setup ---
 service_key_json = os.getenv("GEE_SERVICE_KEY_JSON")
 GEE_AVAILABLE = False  
@@ -67,11 +76,12 @@ print(f"GEE Status: {'✅ Available' if GEE_AVAILABLE else '❌ Not Available'}"
 app = Flask(__name__)
 
 # --- Configuration ---
-DATA_LAG_DAYS = 6
+DATA_LAG_DAYS = 30
+MERRA_LAG_DAYS = 25  # MERRA-2 typical lag is 2-4 weeks
 DAYS_BACK = 1455
 LOOKBACK_DAYS = 90
 MODEL_RETRAINING_DAYS = 7
-CHUNK_SIZE = 7
+CHUNK_SIZE = 30
 
 geolocator = Nominatim(user_agent="air-quality-gee")
 
@@ -89,154 +99,349 @@ def get_coordinates(city_name):
         print(f"Geocoding error for {city_name}: {e}")
         return None
 
-def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
-    """Fetch pollutant data from Google Earth Engine Sentinel-5P satellite data"""
-    if not GEE_AVAILABLE:
+def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
+    """
+    Fetch PM2.5 and PM10 data from OpenAQ for the specified date range.
+    This is used to fill in the gap when MERRA-2 data is not available (recent 2-4 weeks).
+    """
+    try:
+        print(f"  🌐 Fetching OpenAQ PM data from {start_date.date()} to {end_date.date()}...")
+        
+        # Get nearby locations
+        locations_response = openaq_client.locations.list(
+            coordinates=(lat, lon),
+            radius=radius_km * 1000,  # Convert km to meters
+            limit=100
+        )
+        
+        locations = locations_response.results if hasattr(locations_response, 'results') else []
+        print(f"    Found {len(locations)} OpenAQ stations")
+        
+        if not locations:
+            print("    ⚠️ No OpenAQ stations found nearby")
+            return None
+        
+        pm25_values = []
+        pm10_values = []
+        
+        # Convert dates to ISO format for OpenAQ API
+        date_from = start_date.strftime('%Y-%m-%dT00:00:00Z')
+        date_to = end_date.strftime('%Y-%m-%dT23:59:59Z')
+        
+        for loc in locations:
+            if not hasattr(loc, 'sensors') or not loc.sensors:
+                continue
+                
+            for sensor in loc.sensors:
+                try:
+                    parameter = sensor.parameter.name if hasattr(sensor.parameter, 'name') else 'unknown'
+                    parameter_lower = parameter.lower()
+                    sensor_id = sensor.id
+                    
+                    # Fetch PM2.5
+                    if 'pm25' in parameter_lower or 'pm2.5' in parameter_lower:
+                        try:
+                            measurements = openaq_client.measurements.list(
+                                sensors_id=sensor_id,
+                                date_from=date_from,
+                                date_to=date_to,
+                                limit=1000
+                            )
+                            
+                            if measurements and hasattr(measurements, 'results'):
+                                for m in measurements.results:
+                                    if hasattr(m, 'value') and m.value is not None:
+                                        pm25_values.append(m.value)
+                        except Exception as e:
+                            print(f"      Error fetching PM2.5 from sensor {sensor_id}: {e}")
+                    
+                    # Fetch PM10
+                    elif 'pm10' in parameter_lower:
+                        try:
+                            measurements = openaq_client.measurements.list(
+                                sensors_id=sensor_id,
+                                date_from=date_from,
+                                date_to=date_to,
+                                limit=1000
+                            )
+                            
+                            if measurements and hasattr(measurements, 'results'):
+                                for m in measurements.results:
+                                    if hasattr(m, 'value') and m.value is not None:
+                                        pm10_values.append(m.value)
+                        except Exception as e:
+                            print(f"      Error fetching PM10 from sensor {sensor_id}: {e}")
+                            
+                except Exception as e:
+                    print(f"    Error processing sensor: {e}")
+                    continue
+        
+        result = {}
+        if pm25_values:
+            result['pm25'] = np.mean(pm25_values)
+            print(f"    ✓ PM2.5 from OpenAQ: {result['pm25']:.2f} µg/m³ (avg of {len(pm25_values)} measurements)")
+        
+        if pm10_values:
+            result['pm10'] = np.mean(pm10_values)
+            print(f"    ✓ PM10 from OpenAQ: {result['pm10']:.2f} µg/m³ (avg of {len(pm10_values)} measurements)")
+        
+        # If we have PM2.5 but not PM10, estimate PM10
+        if 'pm25' in result and 'pm10' not in result:
+            result['pm10'] = result['pm25'] * 1.8
+            print(f"    ℹ️ PM10 estimated from PM2.5: {result['pm10']:.2f} µg/m³")
+        
+        return result if result else None
+        
+    except AuthError as e:
+        print(f"    ❌ OpenAQ Auth error: {e}")
         return None
-    
+    except BadRequestError as e:
+        print(f"    ❌ OpenAQ Bad request: {e}")
+        return None
+    except Exception as e:
+        print(f"    ❌ OpenAQ error: {e}")
+        traceback.print_exc()
+        return None
+
+def fetch_openaq_current_data(lat, lon, radius_km=25):
+    """
+    Fetch current day air quality data from OpenAQ (real-time).
+    Returns latest measurements for PM2.5, PM10, SO2, NO2, CO near given coordinates.
+    All pollutants are normalized to µg/m³ (CH4 excluded).
+    """
+    try:
+        print(f"  🌐 Fetching current OpenAQ data...")
+
+        locations_response = openaq_client.locations.list(
+            coordinates=(lat, lon),
+            radius=radius_km * 1000,
+            limit=100
+        )
+
+        locations = locations_response.results if hasattr(locations_response, "results") else []
+        print(f"    Found {len(locations)} OpenAQ stations nearby")
+
+        if not locations:
+            print("    ⚠️ No OpenAQ stations found nearby")
+            return None
+
+        pollutant_values = {}
+        target_params = ["pm25", "pm10", "so2", "no2", "co"]
+
+        for loc in locations:
+            if not hasattr(loc, "sensors") or not loc.sensors:
+                continue
+
+            for sensor in loc.sensors:
+                try:
+                    parameter = getattr(sensor.parameter, "name", "unknown").lower()
+                    sensor_id = getattr(sensor, "id", None)
+                    if not sensor_id:
+                        continue
+
+                    for target in target_params:
+                        if target in parameter or target.replace("2", "") in parameter:
+                            try:
+                                measurements = openaq_client.measurements.list(
+                                    sensors_id=sensor_id,  # ✅ FIXED parameter name
+                                    limit=1
+                                )
+
+                                if measurements and hasattr(measurements, "results") and measurements.results:
+                                    latest = measurements.results[0]
+                                    if hasattr(latest, "value") and latest.value is not None:
+                                        val = latest.value
+                                        unit = getattr(latest, "unit", "").lower() if hasattr(latest, "unit") else ""
+
+                                        # --- Normalize Units ---
+                                        # PM2.5 / PM10 (usually already µg/m³)
+                                        if target in ["pm25", "pm10"]:
+                                            if "mg" in unit:
+                                                val *= 1000  # mg/m³ → µg/m³
+                                                unit = "µg/m³"
+                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³ (converted from mg/m³)")
+                                            else:
+                                                unit = "µg/m³"
+                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³")
+
+                                        # SO2 / NO2 (convert ppb/ppm → µg/m³)
+                                        elif target in ["so2", "no2"]:
+                                            if "ppb" in unit:
+                                                if target == "no2":
+                                                    val *= 1.91  # 1 ppb NO2 ≈ 1.91 µg/m³
+                                                elif target == "so2":
+                                                    val *= 2.62  # 1 ppb SO2 ≈ 2.62 µg/m³
+                                                unit = "µg/m³"
+                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³ (converted from ppb)")
+                                            elif "ppm" in unit:
+                                                if target == "no2":
+                                                    val *= 1910  # 1 ppm NO2 ≈ 1910 µg/m³
+                                                elif target == "so2":
+                                                    val *= 2620  # 1 ppm SO2 ≈ 2620 µg/m³
+                                                unit = "µg/m³"
+                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³ (converted from ppm)")
+                                            else:
+                                                unit = "µg/m³"
+                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³")
+
+                                        # CO (convert ppm/mg/m³ → µg/m³)
+                                        elif target == "co":
+                                            if "ppm" in unit:
+                                                val = val * 1.145 * 1000  # ppm → mg/m³ → µg/m³
+                                                unit = "µg/m³"
+                                            elif "mg" in unit:
+                                                val *= 1000  # mg/m³ → µg/m³
+                                                unit = "µg/m³"
+                                            else:
+                                                unit = "µg/m³"
+
+                                        pollutant_values.setdefault(target, []).append(val)
+
+                            except Exception as e:
+                                print(f"      Error fetching {target} from sensor {sensor_id}: {e}")
+                            break  # move to next sensor once matched
+
+                except Exception:
+                    continue
+
+        # --- Average across all stations ---
+        pollutant_data = {k: float(np.mean(v)) for k, v in pollutant_values.items()}
+
+        if not pollutant_data:
+            print("    ⚠️ No pollutant data retrieved from OpenAQ")
+            return None
+
+        print("  ✅ Final averaged pollutant values:")
+        for k, v in pollutant_data.items():
+            print(f"     • {k.upper()}: {v:.2f} µg/m³")
+
+        return pollutant_data
+
+    except Exception as e:
+        print(f"    ❌ OpenAQ current data error: {e}")
+        traceback.print_exc()
+        return None
+
+def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
+    """
+    Fetch pollutant data from Google Earth Engine with OpenAQ fallback for PM data.
+    All pollutants converted to µg/m³ for consistency before storage.
+    """
+
+    if not GEE_AVAILABLE:
+        print("❌ GEE is not available or initialized.")
+        return None
+
     try:
         point = ee.Geometry.Point([lon, lat])
         aoi = point.buffer(radius_km * 1000)
-        
+
         start = ee.Date(start_date.strftime('%Y-%m-%d'))
         end = ee.Date(end_date.strftime('%Y-%m-%d'))
-        
+
         pollutant_data = {}
-        
-        # PM2.5 - Using Aerosol Optical Depth as proxy
-        try:
-            aer_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_AER_AI') \
-                .filterDate(start, end) \
-                .filterBounds(aoi) \
-                .select('absorbing_aerosol_index')
-            
-            if aer_collection.size().getInfo() > 0:
-                aer_stats = aer_collection.mean().reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=1000
-                ).getInfo()
-                if 'absorbing_aerosol_index' in aer_stats and aer_stats['absorbing_aerosol_index'] is not None:
-                    pollutant_data['pm25'] = abs(aer_stats['absorbing_aerosol_index']) * 50
-                    print(f"  ✓ PM25: {pollutant_data['pm25']:.2f} ug")
-        except Exception as e:
-            print(f"  ⚠️ PM2.5 error: {e}")
-        
-        # NO2
-        try:
-            no2_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_NO2') \
-                .filterDate(start, end) \
-                .filterBounds(aoi) \
-                .select('tropospheric_NO2_column_number_density')
-            
-            if no2_collection.size().getInfo() > 0:
-                no2_stats = no2_collection.mean().reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=1000
-                ).getInfo()
-                if 'tropospheric_NO2_column_number_density' in no2_stats and no2_stats['tropospheric_NO2_column_number_density'] is not None:
-                    pollutant_data['no2'] = no2_stats['tropospheric_NO2_column_number_density'] * 46.0055 * 1e6
-                    print(f"  ✓ NO2: {pollutant_data['no2']:.2f} ug")
-        except Exception as e:
-            print(f"  ⚠️ NO2 error: {e}")
-        
-        # SO2
-        try:
-            so2_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_SO2') \
-                .filterDate(start, end) \
-                .filterBounds(aoi) \
-                .select('SO2_column_number_density')
-            
-            if so2_collection.size().getInfo() > 0:
-                so2_stats = so2_collection.mean().reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=1000
-                ).getInfo()
-                if 'SO2_column_number_density' in so2_stats and so2_stats['SO2_column_number_density'] is not None:
-                    pollutant_data['so2'] = so2_stats['SO2_column_number_density'] * 64.066 * 1e6
-                    print(f"  ✓ SO2: {pollutant_data['so2']:.2f} ug")
-        except Exception as e:
-            print(f"  ⚠️ SO2 error: {e}")
-        
-        # CO
-        try:
-            co_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_CO') \
-                .filterDate(start, end) \
-                .filterBounds(aoi) \
-                .select('CO_column_number_density')
-            
-            if co_collection.size().getInfo() > 0:
-                co_stats = co_collection.mean().reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=1000
-                ).getInfo()
-                if 'CO_column_number_density' in co_stats and co_stats['CO_column_number_density'] is not None:
-                    pollutant_data['co'] = co_stats['CO_column_number_density'] * 28.01 * 1e3
-                    print(f"  ✓ CO: {pollutant_data['co']:.2f} ug")
-        except Exception as e:
-            print(f"  ⚠️ CO error: {e}")
-        
-        # O3
-        try:
-            o3_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_O3') \
-                .filterDate(start, end) \
-                .filterBounds(aoi) \
-                .select('O3_column_number_density')
-            
-            if o3_collection.size().getInfo() > 0:
-                o3_stats = o3_collection.mean().reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=1000
-                ).getInfo()
-                if 'O3_column_number_density' in o3_stats and o3_stats['O3_column_number_density'] is not None:
-                    pollutant_data['o3'] = o3_stats['O3_column_number_density'] * 47.9982 * 1e6
-                    print(f"  ✓ O3: {pollutant_data['o3']:.2f} ug")
-        except Exception as e:
-            print(f"  ⚠️ O3 error: {e}")
-        
-        # CH4
-        try:
-            ch4_collection = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_CH4') \
-                .filterDate(start, end) \
-                .filterBounds(aoi) \
-                .select('CH4_column_volume_mixing_ratio_dry_air')
-            
-            ch4_count = ch4_collection.size().getInfo()
-            
-            if ch4_count == 0:
-                print("  ℹ️ CH4 OFFL empty, trying NRTI...")
-                ch4_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_CH4') \
+        TROPOSPHERIC_HEIGHT_M = 8000  # assumed column height
+
+        # --- PM2.5 / PM10 ---
+        days_ago = (datetime.now() - end_date).days
+        use_openaq_for_pm = days_ago < MERRA_LAG_DAYS
+
+        if use_openaq_for_pm:
+            print(f"ℹ️ Using OpenAQ for PM data (within {MERRA_LAG_DAYS} days)")
+            openaq_pm = fetch_openaq_pm_data(lat, lon, start_date, end_date)
+            if openaq_pm:
+                pollutant_data.update(openaq_pm)
+            else:
+                print("⚠️ OpenAQ PM data unavailable, using MERRA-2 fallback")
+                use_openaq_for_pm = False
+
+        if not use_openaq_for_pm:
+            try:
+                aerosol_collection = ee.ImageCollection('NASA/GSFC/MERRA/aer/2') \
                     .filterDate(start, end) \
                     .filterBounds(aoi) \
-                    .select('CH4_column_volume_mixing_ratio_dry_air')
-                ch4_count = ch4_collection.size().getInfo()
-            
-            if ch4_count > 0:
-                ch4_stats = ch4_collection.mean().reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=aoi,
-                    scale=7000
-                ).getInfo()
-                
-                if 'CH4_column_volume_mixing_ratio_dry_air' in ch4_stats and ch4_stats['CH4_column_volume_mixing_ratio_dry_air'] is not None:
-                    pollutant_data['ch4'] = ch4_stats['CH4_column_volume_mixing_ratio_dry_air']
+                    .select(['BCSMASS', 'OCSMASS', 'SO4SMASS', 'DUSMASS25', 'SSSMASS25'])
+
+                if aerosol_collection.size().getInfo() > 0:
+                    pm25_image_kg_m3 = aerosol_collection.mean().reduce(ee.Reducer.sum())
+                    pm25_image_ug_m3 = pm25_image_kg_m3.multiply(1e9)
+
+                    pm25_stats = pm25_image_ug_m3.reduceRegion(
+                        reducer=ee.Reducer.mean(),
+                        geometry=aoi,
+                        scale=50000,
+                        maxPixels=1e9
+                    ).getInfo()
+
+                    if 'sum' in pm25_stats and pm25_stats['sum'] is not None:
+                        pollutant_data['pm25'] = pm25_stats['sum']
+                        pollutant_data['pm10'] = pollutant_data['pm25'] * 1.8
+                        print(f"  ✓ PM2.5 (MERRA-2): {pollutant_data['pm25']:.2f} µg/m³")
+                        print(f"  ✓ PM10 (MERRA-2): {pollutant_data['pm10']:.2f} µg/m³")
+            except Exception as e:
+                print(f"⚠️ MERRA-2 PM error: {e}")
+
+        # --- NO2 ---
+        try:
+            no2 = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_NO2') \
+                .filterDate(start, end).filterBounds(aoi) \
+                .select('tropospheric_NO2_column_number_density')
+            if no2.size().getInfo() > 0:
+                val = no2.mean().reduceRegion(ee.Reducer.mean(), aoi, 1000).getInfo()
+                if val and 'tropospheric_NO2_column_number_density' in val:
+                    pollutant_data['no2'] = val['tropospheric_NO2_column_number_density'] * 46.0055 * 1e6 / TROPOSPHERIC_HEIGHT_M
+                    print(f"  ✓ NO2: {pollutant_data['no2']:.2f} µg/m³")
+        except Exception as e:
+            print(f"⚠️ NO2 error: {e}")
+
+        # --- SO2 ---
+        try:
+            so2 = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_SO2') \
+                .filterDate(start, end).filterBounds(aoi) \
+                .select('SO2_column_number_density')
+            if so2.size().getInfo() > 0:
+                val = so2.mean().reduceRegion(ee.Reducer.mean(), aoi, 1000).getInfo()
+                if val and 'SO2_column_number_density' in val:
+                    pollutant_data['so2'] = val['SO2_column_number_density'] * 64.066 * 1e6 / TROPOSPHERIC_HEIGHT_M
+                    print(f"  ✓ SO2: {pollutant_data['so2']:.2f} µg/m³")
+        except Exception as e:
+            print(f"⚠️ SO2 error: {e}")
+
+        # --- CO ---
+        try:
+            co = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_CO') \
+                .filterDate(start, end).filterBounds(aoi) \
+                .select('CO_column_number_density')
+            if co.size().getInfo() > 0:
+                val = co.mean().reduceRegion(ee.Reducer.mean(), aoi, 1000).getInfo()
+                if val and 'CO_column_number_density' in val:
+                    pollutant_data['co'] = val['CO_column_number_density'] * 28.01 * 1e6 / TROPOSPHERIC_HEIGHT_M
+                    print(f"  ✓ CO: {pollutant_data['co']:.2f} µg/m³")
+        except Exception as e:
+            print(f"⚠️ CO error: {e}")
+
+        # --- CH4 ---
+        try:
+            ch4_collection = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_CH4') \
+                .filterDate(start, end).filterBounds(aoi) \
+                .select('CH4_column_volume_mixing_ratio_dry_air')
+            if ch4_collection.size().getInfo() > 0:
+                ch4_mean_image = ch4_collection.mean()
+                val = ch4_mean_image.reduceRegion(ee.Reducer.mean(), aoi, 7000).getInfo()
+                if val and 'CH4_column_volume_mixing_ratio_dry_air' in val:
+                    raw_value = val['CH4_column_volume_mixing_ratio_dry_air']
+                    # Handle scale issues — if value > 1, assume already scaled ×1e6
+                    if raw_value > 1e-3:  # e.g. 1.8 instead of 1.8e-6
+                        raw_value = raw_value / 1e6
+                    pollutant_data['ch4'] = raw_value * 1e9  # convert mol/mol → ppb
                     print(f"  ✓ CH4: {pollutant_data['ch4']:.2f} ppb")
         except Exception as e:
-            print(f"  ⚠️ CH4 error: {e}")
-        
-        # PM10 (estimated from PM2.5 using typical ratio)
-        if 'pm25' in pollutant_data:
-            pollutant_data['pm10'] = pollutant_data['pm25'] * 1.8
-            print(f"  ✓ PM10: {pollutant_data['pm10']:.2f} ug")
-        
+            print(f"⚠️ CH4 error: {e}")
+
         return pollutant_data
-        
+
     except Exception as e:
-        print(f"  Error fetching GEE pollutant data: {e}")
+        print(f"❌ Error fetching GEE pollutant data: {e}")
         traceback.print_exc()
         return None
 
@@ -344,86 +549,62 @@ def fetch_gee_weather_data(lat, lon, start_date, end_date):
         return None
 
 def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
-    """Fetch historical pollutant and weather data from GEE and store in MongoDB"""
+    """Fetch historical pollutant and weather data from GEE and OpenAQ, store in MongoDB (all pollutants in µg/m³)."""
     coords = get_coordinates(city_name)
     if not coords:
         return {"error": f"Could not find coordinates for {city_name}"}, 404
-    
+
     latitude, longitude = coords
-    print(f"\n📊 Fetching {days_back} days of GEE data for {city_name} (accounting for {DATA_LAG_DAYS}-day lag)...")
-    
+    print(f"\n📊 Fetching {days_back} days of data for {city_name} (accounting for {DATA_LAG_DAYS}-day lag)...")
+
     try:
         safe_end_date = datetime.now() - timedelta(days=DATA_LAG_DAYS)
         start_date = safe_end_date - timedelta(days=days_back)
-        
-        print(f"  📅 Historical data range: {start_date.date()} to {safe_end_date.date()}")
-        print(f"  ⏰ Data lag accounted for: {DATA_LAG_DAYS} days")
-        
+
         stored_count = 0
-        
         current_start = start_date
+
         while current_start < safe_end_date:
             current_end = min(current_start + timedelta(days=CHUNK_SIZE), safe_end_date)
-            
             print(f"  Processing {current_start.date()} to {current_end.date()}...")
-            
+
             pollutant_data = fetch_gee_pollutant_data(latitude, longitude, current_start, current_end)
             weather_data = fetch_gee_weather_data(latitude, longitude, current_start, current_end)
-            
+
             if pollutant_data or weather_data:
                 chunk_days = (current_end - current_start).days
-                
-                for day_offset in range(chunk_days):
-                    record_date = current_start + timedelta(days=day_offset)
-                    
-                    document = {
-                        'city': city_name,
-                        'latitude': latitude,
-                        'longitude': longitude,
-                        'date': record_date.date().isoformat(),
-                        'pm25': pollutant_data.get('pm25') if pollutant_data else None,
-                        'pm10': pollutant_data.get('pm10') if pollutant_data else None,
-                        'so2': pollutant_data.get('so2') if pollutant_data else None,
-                        'no2': pollutant_data.get('no2') if pollutant_data else None,
-                        'co': pollutant_data.get('co') if pollutant_data else None,
-                        'o3': pollutant_data.get('o3') if pollutant_data else None,
-                        'ch4': pollutant_data.get('ch4') if pollutant_data else None,
-                        'temperature': weather_data.get('temperature') if weather_data else None,
-                        'humidity': weather_data.get('humidity') if weather_data else None,
-                        'wind_speed': weather_data.get('wind_speed') if weather_data else None,
-                        'precipitation': weather_data.get('precipitation') if weather_data else None,
-                        'created_at': datetime.utcnow()
+                for i in range(chunk_days):
+                    d = current_start + timedelta(days=i)
+                    doc = {
+                        "city": city_name,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "date": d.date().isoformat(),
+                        **{k: pollutant_data.get(k) for k in ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4']},
+                        **{k: weather_data.get(k) for k in ['temperature', 'humidity', 'wind_speed', 'precipitation'] if weather_data},
+                        "created_at": datetime.now(timezone.utc)
                     }
-                    
                     try:
-                        historical_collection.insert_one(document)
+                        historical_collection.insert_one(doc)
                         stored_count += 1
                     except DuplicateKeyError:
-                        pass  # Skip duplicates
-            
+                        pass
+
             current_start = current_end
-            
-            if stored_count % 50 == 0 and stored_count > 0:
-                print(f"  ✓ Inserted {stored_count} records so far...")
-        
-        print(f"✅ Stored {stored_count} daily records of historical data in MongoDB")
-        
+
+        print(f"✅ Stored {stored_count} daily records for {city_name}")
         return {
             "status": "success",
             "city": city_name,
             "records_stored": stored_count,
-            "date_range": {
-                "start": start_date.strftime('%Y-%m-%d'),
-                "end": safe_end_date.strftime('%Y-%m-%d')
-            },
-            "data_lag_days": DATA_LAG_DAYS,
-            "note": f"Historical data collected up to {DATA_LAG_DAYS} days before current date"
+            "unit": "µg/m³ (all pollutants)",
+            "data_lag_days": DATA_LAG_DAYS
         }, 200
-        
+
     except Exception as e:
-        print(f"Error fetching historical GEE data: {e}")
         traceback.print_exc()
         return {"error": str(e)}, 500
+
 
 def prepare_lstm_data(city_name):
     """Prepare data for LSTM training from MongoDB"""
@@ -431,7 +612,7 @@ def prepare_lstm_data(city_name):
         cursor = historical_collection.find(
             {'city': city_name},
             {'_id': 0, 'date': 1, 'pm25': 1, 'pm10': 1, 'so2': 1, 'no2': 1, 'co': 1, 
-             'o3': 1, 'ch4': 1, 'temperature': 1, 'humidity': 1, 'wind_speed': 1, 'precipitation': 1}
+            'ch4': 1, 'temperature': 1, 'humidity': 1, 'wind_speed': 1, 'precipitation': 1}
         ).sort('date', ASCENDING)
         
         data = list(cursor)
@@ -451,7 +632,7 @@ def prepare_lstm_data(city_name):
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
         
-        numeric_cols = ['pm25', 'pm10', 'so2', 'no2', 'co', 'o3', 'ch4', 
+        numeric_cols = ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4', 
                        'temperature', 'humidity', 'wind_speed', 'precipitation']
         
         for col in numeric_cols:
@@ -480,28 +661,20 @@ def create_lstm_sequences(data, lookback=LOOKBACK_DAYS):
 def save_model_to_mongodb(city_name, model, scaler, metadata):
     """Save trained model and scaler to MongoDB GridFS"""
     try:
-        # Use tempfile for cross-platform compatibility
         temp_dir = tempfile.gettempdir()
         temp_model_path = os.path.join(temp_dir, f"model_{city_name}.keras")
         
-        # Save model to temporary file
         model.save(temp_model_path)
-        
-        # Save scaler to pickle
         scaler_bytes = pickle.dumps(scaler)
         
-        # Read model file
         with open(temp_model_path, 'rb') as f:
             model_bytes = f.read()
         
-        # Delete old model if exists
         models_collection.delete_one({'city': city_name})
         
-        # Store in GridFS
         model_id = fs.put(model_bytes, filename=f"model_{city_name}.keras")
         scaler_id = fs.put(scaler_bytes, filename=f"scaler_{city_name}.pkl")
         
-        # Store metadata
         model_doc = {
             'city': city_name,
             'model_id': model_id,
@@ -512,7 +685,6 @@ def save_model_to_mongodb(city_name, model, scaler, metadata):
         
         models_collection.insert_one(model_doc)
         
-        # Cleanup
         os.remove(temp_model_path)
         
         print(f"  💾 Model and scaler saved to MongoDB GridFS")
@@ -531,11 +703,9 @@ def load_model_from_mongodb(city_name):
         if not model_doc:
             return None, None, None
         
-        # Use tempfile for cross-platform compatibility
         temp_dir = tempfile.gettempdir()
         temp_model_path = os.path.join(temp_dir, f"model_{city_name}.keras")
         
-        # Load model
         model_bytes = fs.get(model_doc['model_id']).read()
         
         with open(temp_model_path, 'wb') as f:
@@ -544,11 +714,9 @@ def load_model_from_mongodb(city_name):
         model = load_model(temp_model_path, compile=False)
         model.compile(optimizer='adam', loss='mse', metrics=['mae'])
         
-        # Load scaler
         scaler_bytes = fs.get(model_doc['scaler_id']).read()
         scaler = pickle.loads(scaler_bytes)
         
-        # Cleanup
         os.remove(temp_model_path)
         
         print(f"  ✓ Model loaded from MongoDB GridFS")
@@ -587,7 +755,7 @@ def train_lstm_model(city_name, force_retrain=False):
     if df is None:
         return {"error": "Insufficient historical data for training"}, 400
     
-    feature_cols = ['pm25', 'pm10', 'so2', 'no2', 'co', 'o3', 'ch4',
+    feature_cols = ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4',
                    'temperature', 'humidity', 'wind_speed', 'precipitation']
     
     data = df[feature_cols].values
@@ -648,7 +816,6 @@ def train_lstm_model(city_name, force_retrain=False):
         'lookback_days': LOOKBACK_DAYS
     }
     
-    # Save to MongoDB
     save_model_to_mongodb(city_name, model, scaler, metadata)
     
     return {
@@ -677,7 +844,7 @@ def predict_next_week(city_name):
     if df is None or len(df) < LOOKBACK_DAYS:
         return {"error": f"Insufficient data for prediction (need {LOOKBACK_DAYS} days)"}, 400
     
-    feature_cols = ['pm25', 'pm10', 'so2', 'no2', 'co', 'o3', 'ch4',
+    feature_cols = ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4',
                    'temperature', 'humidity', 'wind_speed', 'precipitation']
     
     recent_data = df[feature_cols].iloc[-LOOKBACK_DAYS:].values
@@ -712,7 +879,6 @@ def predict_next_week(city_name):
             'so2': float(np.clip(prediction[2], 0, 100)),
             'no2': float(np.clip(prediction[3], 0, 200)),
             'co': float(np.clip(prediction[4], 0, 50)),
-            'o3': float(np.clip(prediction[5], 0, 300)),
             'ch4': float(np.clip(prediction[6], 1700, 2000))
         })
         
@@ -774,7 +940,7 @@ def generate_map_tiles(lat, lon, radius_km=100):
         point = ee.Geometry.Point([lon, lat])
         aoi = point.buffer(radius_km * 1000)
         
-        safe_end_date = datetime.now() - timedelta(days=DATA_LAG_DAYS)
+        safe_end_date = datetime.now()
         safe_start_date = safe_end_date - timedelta(days=7)
         
         end_date = ee.Date(safe_end_date)
@@ -823,19 +989,6 @@ def generate_map_tiles(lat, lon, radius_km=100):
         except Exception as e:
             print(f"  ✗ CO error: {e}")
         
-        # O3
-        try:
-            o3_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_O3') \
-                .filterDate(start_date, end_date) \
-                .filterBounds(aoi) \
-                .select('O3_column_number_density')
-            o3_count = o3_collection.size().getInfo()
-            if o3_count > 0:
-                pollutants_data['O3'] = o3_collection.mean()
-                print(f"  ✓ O3: {o3_count} images")
-        except Exception as e:
-            print(f"  ✗ O3 error: {e}")
-        
         # Aerosol Index
         try:
             aer_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_AER_AI') \
@@ -866,10 +1019,6 @@ def generate_map_tiles(lat, lon, radius_km=100):
         if 'CO' in pollutants_data:
             co_normalized = pollutants_data['CO'].subtract(0.03).divide(0.03).clamp(0, 1)
             normalized_layers.append(co_normalized)
-        
-        if 'O3' in pollutants_data:
-            o3_normalized = pollutants_data['O3'].subtract(0.12).divide(0.04).clamp(0, 1)
-            normalized_layers.append(o3_normalized)
         
         if 'AER_AI' in pollutants_data:
             aer_normalized = pollutants_data['AER_AI'].subtract(-1).divide(3).clamp(0, 1)
@@ -917,63 +1066,65 @@ def generate_map_tiles(lat, lon, radius_km=100):
         return None
 
 def fetch_current_air_quality(city_name):
-    """Fetch current air quality data from GEE"""
+    """Fetch ONLY current day air quality data from OpenAQ (no GEE fallback for pollutants)"""
     coords = get_coordinates(city_name)
     if not coords:
         return {"error": f"Could not find coordinates for {city_name}"}, 404
-    
+
     try:
         latitude, longitude = coords
-        
+
+        print(f"\n📊 Fetching current air quality for {city_name}...")
+
+        # ✅ Fetch ONLY today's AQ data from OpenAQ
+        print(f"  🌐 Fetching current day data from OpenAQ...")
+        openaq_current = fetch_openaq_current_data(latitude, longitude)
+
+        if not openaq_current:
+            return {"error": "No real-time OpenAQ data available for this location"}, 404
+
+        combined_pollutants = {}
+        for key, value in openaq_current.items():
+            unit = "µg/m³" if key != "ch4" else "ppb"
+            combined_pollutants[key.upper()] = {
+                "parameter": key.upper(),
+                "value": value,
+                "unit": unit,
+                "source": "OpenAQ (Real-time)",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        # ✅ Still fetch weather & map (non-AQ) from GEE
         safe_end_date = datetime.now() - timedelta(days=DATA_LAG_DAYS)
         start_date = safe_end_date - timedelta(days=7)
-        
-        print(f"  📅 Fetching current data from {start_date.date()} to {safe_end_date.date()}")
-        
-        pollutant_data = fetch_gee_pollutant_data(latitude, longitude, start_date, safe_end_date)
+
+        print(f"  🌦️ Fetching recent week weather & satellite maps...")
         weather_data = fetch_gee_weather_data(latitude, longitude, start_date, safe_end_date)
-        
-        if not pollutant_data:
-            return {"error": "No current data available from satellites"}, 404
-        
         map_tiles = generate_map_tiles(latitude, longitude, radius_km=100)
-        
-        combined_data = {}
-        if pollutant_data:
-            for key, value in pollutant_data.items():
-                unit = "µg/m³"
-                if key == 'ch4':
-                    unit = "ppb"
-                combined_data[key.upper()] = {
-                    "parameter": key.upper(),
-                    "value": value,
-                    "unit": unit
-                }
-        
+
         result = {
             "city": city_name,
             "coordinates": {"latitude": latitude, "longitude": longitude},
-            "pollutants": combined_data,
+            "pollutants": combined_pollutants,
             "weather": weather_data,
             "map_tiles": map_tiles,
-            "timestamp": safe_end_date.isoformat(),
-            "data_date": safe_end_date.strftime('%Y-%m-%d'),
-            "data_lag_days": DATA_LAG_DAYS,
-            "note": f"Data represents average from {start_date.date()} to {safe_end_date.date()} (accounting for {DATA_LAG_DAYS}-day satellite data lag)"
+            "timestamp": datetime.now().isoformat(),
+            "note": "✅ Real-time pollution from OpenAQ only. Weather & satellite tiles from GEE."
         }
-        
+
         return result, 200
-        
+
     except Exception as e:
-        print(f"Error fetching current data: {e}")
+        print(f"❌ Error fetching current data: {e}")
         traceback.print_exc()
         return {"error": str(e)}, 500
+
 
 # --- Flask API Endpoints ---
 
 @app.route('/api/air-quality', methods=['GET'])
 def air_quality_endpoint():
-    """Get current air quality data from GEE"""
+    """Get current air quality data from OpenAQ and GEE"""
     city_name = request.args.get('city')
     if not city_name:
         return jsonify({"error": "Missing 'city' parameter"}), 400
@@ -983,7 +1134,7 @@ def air_quality_endpoint():
 
 @app.route('/api/collect-historical', methods=['POST'])
 def collect_historical():
-    """Collect historical data from GEE and store in MongoDB"""
+    """Collect historical data from GEE and OpenAQ, store in MongoDB"""
     data = request.get_json()
     city_name = data.get('city')
     days_back = data.get('days_back', DAYS_BACK)
@@ -1027,6 +1178,8 @@ def full_analysis():
     
     if not city_name:
         return jsonify({"error": "Missing 'city' parameter"}), 400
+    
+    city_name = city_name.strip().title()
     
     print(f"\n🚀 Starting full analysis for {city_name}")
     
@@ -1086,11 +1239,17 @@ def full_analysis():
             "days_back": DAYS_BACK,
             "lookback_period": LOOKBACK_DAYS,
             "data_lag_days": DATA_LAG_DAYS,
+            "merra_lag_days": MERRA_LAG_DAYS,
             "model_type": "LSTM",
-            "data_source": "Google Earth Engine",
+            "data_sources": {
+                "current_pm": "OpenAQ (Real-time)",
+                "historical_pm": "OpenAQ (recent) + MERRA-2 (older)",
+                "other_pollutants": "Sentinel-5P",
+                "weather": "ERA5"
+            },
             "database": "MongoDB Atlas",
             "prediction_range": "Tomorrow through next 7 days",
-            "note": f"Historical data accounts for {DATA_LAG_DAYS}-day satellite lag; predictions start from tomorrow"
+            "note": "PM2.5/PM10 from OpenAQ for current and recent data, MERRA-2 for historical. Other pollutants from Sentinel-5P."
         }
     }
     
@@ -1108,16 +1267,23 @@ def health_check():
     return jsonify({
         "status": "ok",
         "gee_available": GEE_AVAILABLE,
+        "openaq_available": True,
         "database": "MongoDB Atlas",
         "database_status": db_status,
-        "service": "Air Quality API with LSTM Predictions (GEE + MongoDB)",
+        "service": "Air Quality API with LSTM Predictions (GEE + OpenAQ + MongoDB)",
         "configuration": {
             "days_back": DAYS_BACK,
             "data_lag_days": DATA_LAG_DAYS,
+            "merra_lag_days": MERRA_LAG_DAYS,
             "lookback_period": LOOKBACK_DAYS,
             "chunk_size": CHUNK_SIZE,
             "model_retraining_days": MODEL_RETRAINING_DAYS,
-            "data_source": "Google Earth Engine Sentinel-5P & ERA5",
+            "data_sources": {
+                "current_data": "OpenAQ (Real-time)",
+                "pm_historical": "OpenAQ (recent 2-4 weeks) + MERRA-2 (older)",
+                "other_pollutants": "Sentinel-5P",
+                "weather": "ERA5"
+            },
             "storage": "MongoDB Atlas with GridFS",
             "prediction_range": "Tomorrow through next 7 days"
         }
@@ -1165,7 +1331,9 @@ def database_stats():
             "total_records": total_records,
             "total_models": total_models,
             "cities": city_stats,
-            "data_lag_days": DATA_LAG_DAYS
+            "data_sources": "OpenAQ + GEE (MERRA-2 + Sentinel-5P)",
+            "data_lag_days": DATA_LAG_DAYS,
+            "merra_lag_days": MERRA_LAG_DAYS
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1185,28 +1353,42 @@ def model_status():
 def home():
     return jsonify({
         "status": "success",
-        "message": "✅ Flask backend with MongoDB Atlas is running successfully on Render!",
+        "message": "✅ Flask backend with MongoDB Atlas and OpenAQ is running successfully!",
         "database": "MongoDB Atlas",
-        "storage": "Persistent (Cloud Database)"
+        "storage": "Persistent (Cloud Database)",
+        "data_sources": {
+            "real_time": "OpenAQ API",
+            "historical_pm": "OpenAQ (recent) + MERRA-2 (older)",
+            "satellite": "Google Earth Engine (Sentinel-5P)",
+            "weather": "ERA5"
+        }
     })
 
 # --- Run Flask App ---
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("🌍 Air Quality API with LSTM Predictions (GEE + MongoDB Atlas)")
+    print("🌍 Air Quality API with LSTM Predictions (GEE + OpenAQ + MongoDB)")
     print("="*70)
     print(f"GEE Status: {'✅ Available' if GEE_AVAILABLE else '❌ Not Available'}")
+    print(f"OpenAQ Status: ✅ Available")
     print(f"Database: MongoDB Atlas")
     print(f"\n📈 CONFIGURATION:")
     print(f"   • Satellite Data Lag: {DATA_LAG_DAYS} days")
+    print(f"   • MERRA-2 Data Lag: {MERRA_LAG_DAYS} days (2-4 weeks)")
     print(f"   • Historical Data Collection: {DAYS_BACK} days (adjusted for lag)")
     print(f"   • Model Type: LSTM (Long Short-Term Memory)")
     print(f"   • Model Lookback Period: {LOOKBACK_DAYS} days")
     print(f"   • Data Storage: MongoDB Atlas (Persistent Cloud Database)")
     print(f"   • Model Storage: GridFS (MongoDB Binary Storage)")
-    print(f"   • Data Source: Google Earth Engine (Sentinel-5P + ERA5)")
+    print(f"\n🌐 DATA SOURCES:")
+    print(f"   • Current Day PM2.5/PM10: OpenAQ (Real-time ground stations)")
+    print(f"   • Recent PM2.5/PM10 (0-{MERRA_LAG_DAYS} days): OpenAQ")
+    print(f"   • Historical PM2.5/PM10 (>{MERRA_LAG_DAYS} days): MERRA-2 Satellite")
+    print(f"   • NO2, SO2, CO,  CH4: Sentinel-5P Satellite")
+    print(f"   • Weather Data: ERA5 Reanalysis")
     print(f"\n🔮 PREDICTION CONFIGURATION:")
     print(f"   • Prediction Start: TOMORROW (Day +1 from today)")
     print(f"   • Prediction End: 7 days from today (Day +7)")
+    print(f"   • Training uses: OpenAQ + GEE integrated data")
     print("="*70 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

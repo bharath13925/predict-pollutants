@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import ee
-import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -15,13 +14,38 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping 
 import os
 from dotenv import load_dotenv
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
+import gridfs
+import tempfile
+
 load_dotenv()
 
-import os, json, ee
-from dotenv import load_dotenv
+# --- MongoDB Configuration ---
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise ValueError("❌ MONGODB_URI environment variable not set!")
 
-load_dotenv()
+try:
+    mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.admin.command('ping')
+    db = mongo_client['air_quality_db']
+    historical_collection = db['historical_data']
+    models_collection = db['models']
+    fs = gridfs.GridFS(db)
+    print("✅ MongoDB Atlas connected successfully")
+    
+    # Create indexes
+    historical_collection.create_index([("city", ASCENDING), ("date", ASCENDING)], unique=True)
+    historical_collection.create_index([("city", ASCENDING)])
+    historical_collection.create_index([("date", ASCENDING)])
+    models_collection.create_index([("city", ASCENDING)], unique=True)
+    
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
+    raise
 
+# --- Google Earth Engine Setup ---
 service_key_json = os.getenv("GEE_SERVICE_KEY_JSON")
 GEE_AVAILABLE = False  
 
@@ -39,60 +63,17 @@ else:
 
 print(f"GEE Status: {'✅ Available' if GEE_AVAILABLE else '❌ Not Available'}")
 
-
 # --- Flask App Configuration ---
 app = Flask(__name__)
 
-# --- Database Setup ---
-DB_NAME = 'air_quality_gee.db'
-
 # --- Configuration ---
-DATA_LAG_DAYS = 6  # Copernicus and ERA5 have 6-day lag
-DAYS_BACK = 1455  # Adjusted from 730 to account for lag (2 years minus lag)
-LOOKBACK_DAYS = 90  # LSTM lookback period
+DATA_LAG_DAYS = 6
+DAYS_BACK = 1455
+LOOKBACK_DAYS = 90
 MODEL_RETRAINING_DAYS = 7
-CHUNK_SIZE = 7  # Collect data in weekly chunks
+CHUNK_SIZE = 7
 
 geolocator = Nominatim(user_agent="air-quality-gee")
-
-def init_database():
-    """Initialize SQLite database for historical data storage"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS historical_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            city TEXT NOT NULL,
-            latitude REAL,
-            longitude REAL,
-            date DATE NOT NULL,
-            pm25 REAL,
-            pm10 REAL,
-            so2 REAL,
-            no2 REAL,
-            co REAL,
-            o3 REAL,
-            ch4 REAL,
-            temperature REAL,
-            humidity REAL,
-            wind_speed REAL,
-            precipitation REAL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(city, date)
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_city_date 
-        ON historical_data(city, date)
-    ''')
-    
-    conn.commit()
-    conn.close()
-    print("✅ Database initialized successfully")
-
-init_database()
 
 def get_coordinates(city_name):
     """Get (latitude, longitude) of a city using Nominatim."""
@@ -109,9 +90,7 @@ def get_coordinates(city_name):
         return None
 
 def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
-    """
-    Fetch pollutant data from Google Earth Engine Sentinel-5P satellite data
-    """
+    """Fetch pollutant data from Google Earth Engine Sentinel-5P satellite data"""
     if not GEE_AVAILABLE:
         return None
     
@@ -246,8 +225,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 if 'CH4_column_volume_mixing_ratio_dry_air' in ch4_stats and ch4_stats['CH4_column_volume_mixing_ratio_dry_air'] is not None:
                     pollutant_data['ch4'] = ch4_stats['CH4_column_volume_mixing_ratio_dry_air']
                     print(f"  ✓ CH4: {pollutant_data['ch4']:.2f} ppb")
-            else:
-                print("  ⚠️ No CH4 data available for this period")
         except Exception as e:
             print(f"  ⚠️ CH4 error: {e}")
         
@@ -264,9 +241,7 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         return None
 
 def fetch_gee_weather_data(lat, lon, start_date, end_date):
-    """
-    Fetch weather data from Google Earth Engine (ERA5 reanalysis data)
-    """
+    """Fetch weather data from Google Earth Engine (ERA5 reanalysis data)"""
     if not GEE_AVAILABLE:
         return None
     
@@ -369,10 +344,7 @@ def fetch_gee_weather_data(lat, lon, start_date, end_date):
         return None
 
 def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
-    """
-    Fetch historical pollutant and weather data from GEE
-    ✅ Collects data from (2 years ago) to (6 days before today)
-    """
+    """Fetch historical pollutant and weather data from GEE and store in MongoDB"""
     coords = get_coordinates(city_name)
     if not coords:
         return {"error": f"Could not find coordinates for {city_name}"}, 404
@@ -381,15 +353,11 @@ def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
     print(f"\n📊 Fetching {days_back} days of GEE data for {city_name} (accounting for {DATA_LAG_DAYS}-day lag)...")
     
     try:
-        # ✅ Stop 6 days before today to avoid incomplete data
         safe_end_date = datetime.now() - timedelta(days=DATA_LAG_DAYS)
         start_date = safe_end_date - timedelta(days=days_back)
         
         print(f"  📅 Historical data range: {start_date.date()} to {safe_end_date.date()}")
         print(f"  ⏰ Data lag accounted for: {DATA_LAG_DAYS} days")
-        
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
         
         stored_count = 0
         
@@ -408,46 +376,37 @@ def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
                 for day_offset in range(chunk_days):
                     record_date = current_start + timedelta(days=day_offset)
                     
-                    cursor.execute(
-                        "SELECT id FROM historical_data WHERE city = ? AND date = ?",
-                        (city_name, record_date.date())
-                    )
+                    document = {
+                        'city': city_name,
+                        'latitude': latitude,
+                        'longitude': longitude,
+                        'date': record_date.date().isoformat(),
+                        'pm25': pollutant_data.get('pm25') if pollutant_data else None,
+                        'pm10': pollutant_data.get('pm10') if pollutant_data else None,
+                        'so2': pollutant_data.get('so2') if pollutant_data else None,
+                        'no2': pollutant_data.get('no2') if pollutant_data else None,
+                        'co': pollutant_data.get('co') if pollutant_data else None,
+                        'o3': pollutant_data.get('o3') if pollutant_data else None,
+                        'ch4': pollutant_data.get('ch4') if pollutant_data else None,
+                        'temperature': weather_data.get('temperature') if weather_data else None,
+                        'humidity': weather_data.get('humidity') if weather_data else None,
+                        'wind_speed': weather_data.get('wind_speed') if weather_data else None,
+                        'precipitation': weather_data.get('precipitation') if weather_data else None,
+                        'created_at': datetime.utcnow()
+                    }
                     
-                    if cursor.fetchone() is None:
-                        cursor.execute('''
-                            INSERT INTO historical_data 
-                            (city, latitude, longitude, date, pm25, pm10, so2, no2, co, o3, ch4,
-                             temperature, humidity, wind_speed, precipitation)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            city_name,
-                            latitude,
-                            longitude,
-                            record_date.date(),
-                            pollutant_data.get('pm25') if pollutant_data else None,
-                            pollutant_data.get('pm10') if pollutant_data else None,
-                            pollutant_data.get('so2') if pollutant_data else None,
-                            pollutant_data.get('no2') if pollutant_data else None,
-                            pollutant_data.get('co') if pollutant_data else None,
-                            pollutant_data.get('o3') if pollutant_data else None,
-                            pollutant_data.get('ch4') if pollutant_data else None,
-                            weather_data.get('temperature') if weather_data else None,
-                            weather_data.get('humidity') if weather_data else None,
-                            weather_data.get('wind_speed') if weather_data else None,
-                            weather_data.get('precipitation') if weather_data else None
-                        ))
+                    try:
+                        historical_collection.insert_one(document)
                         stored_count += 1
+                    except DuplicateKeyError:
+                        pass  # Skip duplicates
             
             current_start = current_end
             
             if stored_count % 50 == 0 and stored_count > 0:
-                conn.commit()
-                print(f"  ✓ Committed {stored_count} records so far...")
+                print(f"  ✓ Inserted {stored_count} records so far...")
         
-        conn.commit()
-        conn.close()
-        
-        print(f"✅ Stored {stored_count} daily records of historical data")
+        print(f"✅ Stored {stored_count} daily records of historical data in MongoDB")
         
         return {
             "status": "success",
@@ -467,22 +426,25 @@ def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
         return {"error": str(e)}, 500
 
 def prepare_lstm_data(city_name):
-    """Prepare data for LSTM training"""
+    """Prepare data for LSTM training from MongoDB"""
     try:
-        conn = sqlite3.connect(DB_NAME)
-        query = '''
-            SELECT date, pm25, pm10, so2, no2, co, o3, ch4,
-                   temperature, humidity, wind_speed, precipitation
-            FROM historical_data
-            WHERE city = ?
-            ORDER BY date
-        '''
-        df = pd.read_sql_query(query, conn, params=(city_name,))
-        conn.close()
+        cursor = historical_collection.find(
+            {'city': city_name},
+            {'_id': 0, 'date': 1, 'pm25': 1, 'pm10': 1, 'so2': 1, 'no2': 1, 'co': 1, 
+             'o3': 1, 'ch4': 1, 'temperature': 1, 'humidity': 1, 'wind_speed': 1, 'precipitation': 1}
+        ).sort('date', ASCENDING)
+        
+        data = list(cursor)
+        
+        if not data:
+            print(f"  ⚠️ No data found for {city_name}")
+            return None
+        
+        df = pd.DataFrame(data)
         
         min_records_needed = LOOKBACK_DAYS + 20
         
-        if df.empty or len(df) < min_records_needed:
+        if len(df) < min_records_needed:
             print(f"  ⚠️ Insufficient data: Found {len(df)} rows, need at least {min_records_needed}")
             return None
         
@@ -497,7 +459,7 @@ def prepare_lstm_data(city_name):
                 df[col] = df[col].interpolate(method='linear', limit_direction='both')
                 df[col] = df[col].fillna(df[col].median())
         
-        print(f"  ✓ Prepared {len(df)} days of training data")
+        print(f"  ✓ Prepared {len(df)} days of training data from MongoDB")
         return df
         
     except Exception as e:
@@ -511,45 +473,114 @@ def create_lstm_sequences(data, lookback=LOOKBACK_DAYS):
     
     for i in range(lookback, len(data)):
         X.append(data[i-lookback:i])
-        y.append(data[i, :7])  # Predict only pollutants (first 7 features)
+        y.append(data[i, :7])
     
     return np.array(X), np.array(y)
 
+def save_model_to_mongodb(city_name, model, scaler, metadata):
+    """Save trained model and scaler to MongoDB GridFS"""
+    try:
+        # Use tempfile for cross-platform compatibility
+        temp_dir = tempfile.gettempdir()
+        temp_model_path = os.path.join(temp_dir, f"model_{city_name}.keras")
+        
+        # Save model to temporary file
+        model.save(temp_model_path)
+        
+        # Save scaler to pickle
+        scaler_bytes = pickle.dumps(scaler)
+        
+        # Read model file
+        with open(temp_model_path, 'rb') as f:
+            model_bytes = f.read()
+        
+        # Delete old model if exists
+        models_collection.delete_one({'city': city_name})
+        
+        # Store in GridFS
+        model_id = fs.put(model_bytes, filename=f"model_{city_name}.keras")
+        scaler_id = fs.put(scaler_bytes, filename=f"scaler_{city_name}.pkl")
+        
+        # Store metadata
+        model_doc = {
+            'city': city_name,
+            'model_id': model_id,
+            'scaler_id': scaler_id,
+            'metadata': metadata,
+            'trained_at': datetime.utcnow()
+        }
+        
+        models_collection.insert_one(model_doc)
+        
+        # Cleanup
+        os.remove(temp_model_path)
+        
+        print(f"  💾 Model and scaler saved to MongoDB GridFS")
+        return True
+        
+    except Exception as e:
+        print(f"Error saving model to MongoDB: {e}")
+        traceback.print_exc()
+        return False
+
+def load_model_from_mongodb(city_name):
+    """Load trained model and scaler from MongoDB GridFS"""
+    try:
+        model_doc = models_collection.find_one({'city': city_name})
+        
+        if not model_doc:
+            return None, None, None
+        
+        # Use tempfile for cross-platform compatibility
+        temp_dir = tempfile.gettempdir()
+        temp_model_path = os.path.join(temp_dir, f"model_{city_name}.keras")
+        
+        # Load model
+        model_bytes = fs.get(model_doc['model_id']).read()
+        
+        with open(temp_model_path, 'wb') as f:
+            f.write(model_bytes)
+        
+        model = load_model(temp_model_path, compile=False)
+        model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        
+        # Load scaler
+        scaler_bytes = fs.get(model_doc['scaler_id']).read()
+        scaler = pickle.loads(scaler_bytes)
+        
+        # Cleanup
+        os.remove(temp_model_path)
+        
+        print(f"  ✓ Model loaded from MongoDB GridFS")
+        return model, scaler, model_doc['metadata']
+        
+    except Exception as e:
+        print(f"Error loading model from MongoDB: {e}")
+        traceback.print_exc()
+        return None, None, None
+
 def train_lstm_model(city_name, force_retrain=False):
-    """
-    Train LSTM model for air quality prediction
-    """
+    """Train LSTM model for air quality prediction"""
     print(f"\n🤖 Training LSTM model for {city_name}...")
     
-    model_filename = f"lstm_model_{city_name.replace(' ', '_')}.keras"
-    scaler_filename = f"scaler_{city_name.replace(' ', '_')}.pkl"
-    
-    if not force_retrain and os.path.exists(model_filename):
-        model_time = datetime.fromtimestamp(os.path.getmtime(model_filename))
-        age_days = (datetime.now() - model_time).days
+    if not force_retrain:
+        model_doc = models_collection.find_one({'city': city_name})
         
-        if age_days <= MODEL_RETRAINING_DAYS:
-            print(f"  ✅ Using existing model (only {age_days} days old)")
+        if model_doc:
+            model_time = model_doc['trained_at']
+            age_days = (datetime.utcnow() - model_time).days
             
-            metadata_file = f"model_metadata_{city_name.replace(' ', '_')}.json"
-            if os.path.exists(metadata_file):
-                with open(metadata_file, 'r') as f:
-                    metadata = json.load(f)
+            if age_days <= MODEL_RETRAINING_DAYS:
+                print(f"  ✅ Using existing model (only {age_days} days old)")
+                metadata = model_doc['metadata']
                 
                 return {
                     "status": "success",
                     "model_type": "LSTM",
                     "trained_at": model_time.isoformat(),
                     "age_days": age_days,
-                    "train_loss": metadata.get('train_loss'),
-                    "train_mae": metadata.get('train_mae'),
-                    "test_loss": metadata.get('test_loss'),
-                    "test_mae": metadata.get('test_mae'),
-                    "training_samples": metadata.get('training_samples'),
-                    "test_samples": metadata.get('test_samples'),
-                    "model_file": model_filename,
-                    "lookback_days": LOOKBACK_DAYS,
-                    "message": "Using existing trained model"
+                    **metadata,
+                    "message": "Using existing trained model from MongoDB"
                 }, 200
     
     df = prepare_lstm_data(city_name)
@@ -607,10 +638,6 @@ def train_lstm_model(city_name, force_retrain=False):
     print(f"     Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}")
     print(f"     Test Loss: {test_loss:.4f}, Test MAE: {test_mae:.4f}")
     
-    model.save(model_filename)
-    with open(scaler_filename, 'wb') as f:
-        pickle.dump(scaler, f)
-    
     metadata = {
         'train_loss': float(train_loss),
         'train_mae': float(train_mae),
@@ -618,63 +645,34 @@ def train_lstm_model(city_name, force_retrain=False):
         'test_mae': float(test_mae),
         'training_samples': len(X_train),
         'test_samples': len(X_test),
-        'trained_at': datetime.now().isoformat(),
         'lookback_days': LOOKBACK_DAYS
     }
     
-    metadata_file = f"model_metadata_{city_name.replace(' ', '_')}.json"
-    with open(metadata_file, 'w') as f:
-        json.dump(metadata, f)
-    
-    print(f"  💾 Model saved to {model_filename}")
+    # Save to MongoDB
+    save_model_to_mongodb(city_name, model, scaler, metadata)
     
     return {
         "status": "success",
         "model_type": "LSTM",
-        "trained_at": datetime.now().isoformat(),
+        "trained_at": datetime.utcnow().isoformat(),
         "age_days": 0,
-        "train_loss": float(train_loss),
-        "train_mae": float(train_mae),
-        "test_loss": float(test_loss),
-        "test_mae": float(test_mae),
-        "training_samples": len(X_train),
-        "test_samples": len(X_test),
-        "model_file": model_filename,
-        "lookback_days": LOOKBACK_DAYS
+        **metadata
     }, 200
 
-
 def predict_next_week(city_name):
-    """
-    ✅ FIXED: Predict pollutant levels for next 7 days starting from TOMORROW
-    Predictions: Tomorrow (Day +1) to Day +7 from current date
-    """
+    """Predict pollutant levels for next 7 days starting from TOMORROW"""
     print(f"\n🔮 Generating predictions for {city_name}...")
     
-    model_filename = f"lstm_model_{city_name.replace(' ', '_')}.keras"
-    model_filename_legacy = f"lstm_model_{city_name.replace(' ', '_')}.h5"
-    scaler_filename = f"scaler_{city_name.replace(' ', '_')}.pkl"
-    
     try:
-        if os.path.exists(model_filename):
-            model = load_model(model_filename, compile=False)
-            model.compile(optimizer='adam', loss='mse', metrics=['mae'])
-            print(f"  ✓ Model loaded: LSTM (.keras format)")
-        elif os.path.exists(model_filename_legacy):
-            model = load_model(model_filename_legacy, compile=False)
-            model.compile(optimizer='adam', loss='mse', metrics=['mae'])
-            print(f"  ✓ Model loaded: LSTM (.h5 format - legacy)")
-        else:
+        model, scaler, metadata = load_model_from_mongodb(city_name)
+        
+        if model is None:
             return {"error": f"Model not trained yet for {city_name}. Please train the model first."}, 400
-            
-        with open(scaler_filename, 'rb') as f:
-            scaler = pickle.load(f)
             
     except Exception as e:
         print(f"  Error loading model: {e}")
         return {"error": f"Error loading model: {str(e)}"}, 500
     
-    # Get recent data
     df = prepare_lstm_data(city_name)
     if df is None or len(df) < LOOKBACK_DAYS:
         return {"error": f"Insufficient data for prediction (need {LOOKBACK_DAYS} days)"}, 400
@@ -688,30 +686,27 @@ def predict_next_week(city_name):
     predictions = []
     current_sequence = recent_data_scaled.copy()
     
-    # ✅ FIXED: Start predictions from TOMORROW (not accounting for data lag)
     today = datetime.now()
     
     print(f"  📅 Today's date: {today.date()}")
     print(f"  🔮 Predicting from: {(today + timedelta(days=1)).date()} to {(today + timedelta(days=7)).date()}")
     
     for day in range(7):
-        # ✅ Predict for tomorrow (day+1) through next week (day+7)
         X_input = current_sequence[-LOOKBACK_DAYS:].reshape(1, LOOKBACK_DAYS, len(feature_cols))
         
         prediction_scaled = model.predict(X_input, verbose=0)[0]
         
         full_prediction = np.zeros(len(feature_cols))
         full_prediction[:7] = prediction_scaled
-        full_prediction[7:] = current_sequence[-1, 7:]  # Keep weather data same
+        full_prediction[7:] = current_sequence[-1, 7:]
         
         prediction = scaler.inverse_transform(full_prediction.reshape(1, -1))[0]
         
-        # ✅ FIXED: Start from tomorrow (day + 1)
         pred_date = today + timedelta(days=day+1)
         predictions.append({
             'date': pred_date.strftime('%Y-%m-%d'),
             'day': pred_date.strftime('%A'),
-            'day_offset': day + 1,  # Tomorrow is +1, day after is +2, etc.
+            'day_offset': day + 1,
             'pm25': float(np.clip(prediction[0], 0, 500)),
             'pm10': float(np.clip(prediction[1], 0, 600)),
             'so2': float(np.clip(prediction[2], 0, 100)),
@@ -739,45 +734,37 @@ def predict_next_week(city_name):
         "note": "Predictions start from tomorrow and extend 7 days into the future"
     }, 200
 
-
 def model_status_check(city_name):
     """Check model status for a city"""
-    model_filename = f"lstm_model_{city_name.replace(' ', '_')}.keras"
-    model_filename_legacy = f"lstm_model_{city_name.replace(' ', '_')}.h5"
-    
-    if os.path.exists(model_filename):
-        model_file = model_filename
-        model_format = "keras (native)"
-    elif os.path.exists(model_filename_legacy):
-        model_file = model_filename_legacy
-        model_format = "h5 (legacy)"
-    else:
+    try:
+        model_doc = models_collection.find_one({'city': city_name})
+        
+        if not model_doc:
+            return {
+                "status": "not_found",
+                "city": city_name,
+                "message": "No trained model exists for this city"
+            }, 404
+        
+        model_time = model_doc['trained_at']
+        age_days = (datetime.utcnow() - model_time).days
+        
         return {
-            "status": "not_found",
+            "status": "found",
             "city": city_name,
-            "message": "No trained model exists for this city"
-        }, 404
-    
-    model_time = datetime.fromtimestamp(os.path.getmtime(model_file))
-    age_days = (datetime.now() - model_time).days
-    
-    return {
-        "status": "found",
-        "city": city_name,
-        "model_type": "LSTM",
-        "model_format": model_format,
-        "trained_at": model_time.isoformat(),
-        "age_days": age_days,
-        "needs_retraining": age_days > MODEL_RETRAINING_DAYS,
-        "lookback_days": LOOKBACK_DAYS,
-        "model_file": model_file
-    }, 200
+            "model_type": "LSTM",
+            "trained_at": model_time.isoformat(),
+            "age_days": age_days,
+            "needs_retraining": age_days > MODEL_RETRAINING_DAYS,
+            "lookback_days": LOOKBACK_DAYS,
+            "metadata": model_doc['metadata']
+        }, 200
+        
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 def generate_map_tiles(lat, lon, radius_km=100):
-    """
-    Generate interactive map tile URL
-    Uses data from safe date range (accounting for lag)
-    """
+    """Generate interactive map tile URL"""
     if not GEE_AVAILABLE:
         return None
     
@@ -930,10 +917,7 @@ def generate_map_tiles(lat, lon, radius_km=100):
         return None
 
 def fetch_current_air_quality(city_name):
-    """
-    Fetch current air quality data from GEE
-    Uses safe date range (accounting for 6-day lag)
-    """
+    """Fetch current air quality data from GEE"""
     coords = get_coordinates(city_name)
     if not coords:
         return {"error": f"Could not find coordinates for {city_name}"}, 404
@@ -999,7 +983,7 @@ def air_quality_endpoint():
 
 @app.route('/api/collect-historical', methods=['POST'])
 def collect_historical():
-    """Collect historical data from GEE"""
+    """Collect historical data from GEE and store in MongoDB"""
     data = request.get_json()
     city_name = data.get('city')
     days_back = data.get('days_back', DAYS_BACK)
@@ -1012,7 +996,7 @@ def collect_historical():
 
 @app.route('/api/train-model', methods=['POST'])
 def train_model():
-    """Train LSTM prediction model"""
+    """Train LSTM prediction model and store in MongoDB"""
     data = request.get_json()
     city_name = data.get('city')
     force_retrain = data.get('force_retrain', False)
@@ -1044,14 +1028,12 @@ def full_analysis():
     if not city_name:
         return jsonify({"error": "Missing 'city' parameter"}), 400
     
+    city_name = city_name.strip().title()
+    
     print(f"\n🚀 Starting full analysis for {city_name}")
     
-    print("\n📊 Step 1: Checking historical data...")
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM historical_data WHERE city = ?", (city_name,))
-    existing_records = cursor.fetchone()[0]
-    conn.close()
+    print("\n📊 Step 1: Checking historical data in MongoDB...")
+    existing_records = historical_collection.count_documents({'city': city_name})
     
     min_records = LOOKBACK_DAYS + 20
     
@@ -1064,7 +1046,7 @@ def full_analysis():
         print(f"  ✅ Sufficient data exists ({existing_records} records)")
         hist_result = {
             "status": "skipped", 
-            "message": "Sufficient data already exists", 
+            "message": "Sufficient data already exists in MongoDB", 
             "records": existing_records,
             "records_stored": existing_records
         }
@@ -1098,7 +1080,6 @@ def full_analysis():
             "training_samples": train_result.get("training_samples"),
             "test_samples": train_result.get("test_samples"),
             "lookback_days": train_result.get("lookback_days", LOOKBACK_DAYS),
-            "model_file": train_result.get("model_file"),
             "message": train_result.get("message", "Model training completed")
         },
         "predictions": pred_result,
@@ -1109,6 +1090,7 @@ def full_analysis():
             "data_lag_days": DATA_LAG_DAYS,
             "model_type": "LSTM",
             "data_source": "Google Earth Engine",
+            "database": "MongoDB Atlas",
             "prediction_range": "Tomorrow through next 7 days",
             "note": f"Historical data accounts for {DATA_LAG_DAYS}-day satellite lag; predictions start from tomorrow"
         }
@@ -1119,11 +1101,18 @@ def full_analysis():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    try:
+        mongo_client.admin.command('ping')
+        db_status = "connected"
+    except:
+        db_status = "disconnected"
+    
     return jsonify({
         "status": "ok",
         "gee_available": GEE_AVAILABLE,
-        "database": DB_NAME,
-        "service": "Air Quality API with LSTM Predictions (GEE-based)",
+        "database": "MongoDB Atlas",
+        "database_status": db_status,
+        "service": "Air Quality API with LSTM Predictions (GEE + MongoDB)",
         "configuration": {
             "days_back": DAYS_BACK,
             "data_lag_days": DATA_LAG_DAYS,
@@ -1131,45 +1120,52 @@ def health_check():
             "chunk_size": CHUNK_SIZE,
             "model_retraining_days": MODEL_RETRAINING_DAYS,
             "data_source": "Google Earth Engine Sentinel-5P & ERA5",
-            "prediction_range": "Tomorrow through next 7 days",
-            "note": f"Historical data collection accounts for {DATA_LAG_DAYS}-day lag; predictions are for future dates"
+            "storage": "MongoDB Atlas with GridFS",
+            "prediction_range": "Tomorrow through next 7 days"
         }
     }), 200
 
 @app.route('/api/database-stats', methods=['GET'])
 def database_stats():
-    """Get database statistics"""
+    """Get MongoDB database statistics"""
     try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
+        total_records = historical_collection.count_documents({})
         
-        cursor.execute("SELECT COUNT(*) FROM historical_data")
-        total_records = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT DISTINCT city FROM historical_data")
-        cities = [row[0] for row in cursor.fetchall()]
+        pipeline = [
+            {"$group": {"_id": "$city"}},
+            {"$project": {"city": "$_id", "_id": 0}}
+        ]
+        cities = [doc['city'] for doc in historical_collection.aggregate(pipeline)]
         
         city_stats = {}
         for city in cities:
-            cursor.execute("""
-                SELECT MIN(date), MAX(date), COUNT(*) 
-                FROM historical_data 
-                WHERE city = ?
-            """, (city,))
-            min_date, max_date, count = cursor.fetchone()
-            city_stats[city] = {
-                "records": count,
-                "date_range": {
-                    "start": min_date,
-                    "end": max_date
+            pipeline = [
+                {"$match": {"city": city}},
+                {"$group": {
+                    "_id": None,
+                    "min_date": {"$min": "$date"},
+                    "max_date": {"$max": "$date"},
+                    "count": {"$sum": 1}
+                }}
+            ]
+            result = list(historical_collection.aggregate(pipeline))
+            
+            if result:
+                city_stats[city] = {
+                    "records": result[0]['count'],
+                    "date_range": {
+                        "start": result[0]['min_date'],
+                        "end": result[0]['max_date']
+                    }
                 }
-            }
         
-        conn.close()
+        total_models = models_collection.count_documents({})
         
         return jsonify({
             "status": "success",
+            "database": "MongoDB Atlas",
             "total_records": total_records,
+            "total_models": total_models,
             "cities": city_stats,
             "data_lag_days": DATA_LAG_DAYS
         }), 200
@@ -1191,34 +1187,28 @@ def model_status():
 def home():
     return jsonify({
         "status": "success",
-        "message": "✅ Flask backend is running successfully on Render!"
+        "message": "✅ Flask backend with MongoDB Atlas is running successfully on Render!",
+        "database": "MongoDB Atlas",
+        "storage": "Persistent (Cloud Database)"
     })
 
 # --- Run Flask App ---
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("🌍 Air Quality API with LSTM Predictions (GEE-BASED)")
+    print("🌍 Air Quality API with LSTM Predictions (GEE + MongoDB Atlas)")
     print("="*70)
     print(f"GEE Status: {'✅ Available' if GEE_AVAILABLE else '❌ Not Available'}")
-    print(f"Database: {DB_NAME}")
+    print(f"Database: MongoDB Atlas")
     print(f"\n📈 CONFIGURATION:")
     print(f"   • Satellite Data Lag: {DATA_LAG_DAYS} days")
     print(f"   • Historical Data Collection: {DAYS_BACK} days (adjusted for lag)")
-    print(f"   • Historical Data Range: ~4 years ago to {DATA_LAG_DAYS} days ago")
     print(f"   • Model Type: LSTM (Long Short-Term Memory)")
     print(f"   • Model Lookback Period: {LOOKBACK_DAYS} days")
-    print(f"   • Data Collection Chunk Size: {CHUNK_SIZE} days")
-    print(f"   • Model Cache Duration: {MODEL_RETRAINING_DAYS} days")
+    print(f"   • Data Storage: MongoDB Atlas (Persistent Cloud Database)")
+    print(f"   • Model Storage: GridFS (MongoDB Binary Storage)")
     print(f"   • Data Source: Google Earth Engine (Sentinel-5P + ERA5)")
-    print(f"   • Pollutants: PM2.5, PM10, SO2, NO2, CO, O3, CH4")
-    print(f"   • Weather: Temperature, Humidity, Wind Speed, Precipitation")
     print(f"\n🔮 PREDICTION CONFIGURATION:")
     print(f"   • Prediction Start: TOMORROW (Day +1 from today)")
     print(f"   • Prediction End: 7 days from today (Day +7)")
-    print(f"   • Prediction Duration: 7 days into the future")
-    print(f"\n⚠️  DATA FLOW:")
-    print(f"   • Historical Collection: Stops {DATA_LAG_DAYS} days before today (satellite lag)")
-    print(f"   • Model Training: Uses historical data up to {DATA_LAG_DAYS} days ago")
-    print(f"   • Predictions: Start from TOMORROW, no lag applied (future forecast)")
     print("="*70 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

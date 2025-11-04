@@ -59,7 +59,19 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Map<String, dynamic>? _trainingResult;
 
   // CHANGE THIS TO YOUR SERVER IP
-  final String baseUrl = "https://air-quality-api-etwm.onrender.com/api";
+  final String baseUrl = "http://10.35.37.104:5000/api";
+
+  double _normalizeValue(String pollutant, double value, String unit) {
+    if (pollutant.toUpperCase().contains('CO')) {
+      if (unit.toLowerCase().contains('ppm')) {
+        return value * 1145; // ppm → µg/m³
+      } else if (unit.toLowerCase().contains('mg')) {
+        return value * 1000; // mg/m³ → µg/m³
+      }
+    }
+    // You can extend this for SO2, NO2 etc. if needed
+    return value;
+  }
 
   /// ✅ COMPREHENSIVE ACCURACY CALCULATION
   /// Based on MAE (Mean Absolute Error), Test Loss, and Model Confidence
@@ -371,6 +383,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       (data["pollutants"] as Map).forEach((key, pollutantInfo) {
         if (pollutantInfo is Map) {
           dynamic rawValue = pollutantInfo["value"];
+          String unit = pollutantInfo["unit"]?.toString() ?? "";
           double? value;
 
           if (rawValue != null) {
@@ -384,10 +397,14 @@ class _AirAwareHomeState extends State<AirAwareHome> {
           }
 
           if (value != null) {
+            // ✅ Normalize CO and similar pollutants before using
+            value = _normalizeValue(key, value, unit);
+
             pollutantData[key] = {
               "value": value,
-              "unit": pollutantInfo["unit"]?.toString() ?? "",
+              "unit": "µg/m³", // Standardized unit for display
               "parameter": pollutantInfo["parameter"]?.toString() ?? key,
+              "source": pollutantInfo["source"]?.toString() ?? "GEE/OpenAQ",
             };
           }
         }
@@ -419,6 +436,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
         "map_tiles": mapTiles,
         "coordinates": data["coordinates"],
         "timestamp": data["timestamp"],
+        "note": data["note"] ?? "",
       };
     }
     return null;
@@ -465,7 +483,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Could not load predictions: $e\n\nTip: Run "Full AI Analysis" first to train the model',
+              'Could not load predictions: $e\n\nTip: Run "Generate Predictions" first to train the model',
             ),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 5),
@@ -480,11 +498,16 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   ) {
     int maxLevel = 0;
     String worstPollutant = "";
+    double maxValue = 0.0;
 
     pollutants.forEach((parameter, data) {
-      int level = _getAQILevel(parameter, data["value"], data["unit"]);
-      if (level > maxLevel) {
+      double value = data["value"];
+      int level = _getAQILevel(parameter, value);
+
+      // ✅ Find worst pollutant based on AQI level first, then value
+      if (level > maxLevel || (level == maxLevel && value > maxValue)) {
         maxLevel = level;
+        maxValue = value;
         worstPollutant = parameter;
       }
     });
@@ -497,85 +520,66 @@ class _AirAwareHomeState extends State<AirAwareHome> {
     };
   }
 
-  int _getAQILevel(String parameter, double value, String unit) {
+  int _getAQILevel(String parameter, double value) {
     String paramNormalized = parameter
         .toUpperCase()
         .replaceAll('₂', '2')
         .replaceAll('₃', '3')
         .replaceAll('₄', '4');
 
-    double valueInUgM3 = value;
-
-    if (unit.toLowerCase() == "ppb") {
-      if (paramNormalized.contains("NO2")) {
-        valueInUgM3 = value * 1.88;
-      } else if (paramNormalized.contains("SO2")) {
-        valueInUgM3 = value * 2.62;
-      } else if (paramNormalized.contains("CO")) {
-        valueInUgM3 = value * 1.145;
-      } else if (paramNormalized.contains("O3")) {
-        valueInUgM3 = value * 1.96;
-      } else if (paramNormalized.contains("CH4")) {
-        if (value <= 1800) return 0;
-        if (value <= 1850) return 1;
-        if (value <= 1900) return 2;
-        if (value <= 1950) return 3;
-        if (value <= 2000) return 4;
-        return 5;
-      }
-    }
-
+    // ✅ All values are in µg/m³ (except CH4 in ppb)
     if (paramNormalized.contains("PM2.5") || paramNormalized == "PM25") {
-      if (valueInUgM3 <= 30) return 0;
-      if (valueInUgM3 <= 60) return 1;
-      if (valueInUgM3 <= 90) return 2;
-      if (valueInUgM3 <= 120) return 3;
-      if (valueInUgM3 <= 250) return 4;
+      if (value <= 30) return 0;
+      if (value <= 60) return 1;
+      if (value <= 90) return 2;
+      if (value <= 120) return 3;
+      if (value <= 250) return 4;
       return 5;
     }
 
     if (paramNormalized.contains("PM10")) {
-      if (valueInUgM3 <= 50) return 0;
-      if (valueInUgM3 <= 100) return 1;
-      if (valueInUgM3 <= 250) return 2;
-      if (valueInUgM3 <= 350) return 3;
-      if (valueInUgM3 <= 430) return 4;
+      if (value <= 50) return 0;
+      if (value <= 100) return 1;
+      if (value <= 250) return 2;
+      if (value <= 350) return 3;
+      if (value <= 430) return 4;
       return 5;
     }
 
     if (paramNormalized.contains("NO2")) {
-      if (valueInUgM3 <= 40) return 0;
-      if (valueInUgM3 <= 80) return 1;
-      if (valueInUgM3 <= 180) return 2;
-      if (valueInUgM3 <= 280) return 3;
-      if (valueInUgM3 <= 400) return 4;
+      if (value <= 40) return 0;
+      if (value <= 80) return 1;
+      if (value <= 180) return 2;
+      if (value <= 280) return 3;
+      if (value <= 400) return 4;
       return 5;
     }
 
     if (paramNormalized.contains("SO2")) {
-      if (valueInUgM3 <= 40) return 0;
-      if (valueInUgM3 <= 80) return 1;
-      if (valueInUgM3 <= 380) return 2;
-      if (valueInUgM3 <= 800) return 3;
-      if (valueInUgM3 <= 1600) return 4;
+      if (value <= 40) return 0;
+      if (value <= 80) return 1;
+      if (value <= 380) return 2;
+      if (value <= 800) return 3;
+      if (value <= 1600) return 4;
       return 5;
     }
 
     if (paramNormalized.contains("CO")) {
-      if (valueInUgM3 <= 1000) return 0;
-      if (valueInUgM3 <= 2000) return 1;
-      if (valueInUgM3 <= 10000) return 2;
-      if (valueInUgM3 <= 17000) return 3;
-      if (valueInUgM3 <= 34000) return 4;
+      if (value <= 1000) return 0;
+      if (value <= 2000) return 1;
+      if (value <= 10000) return 2;
+      if (value <= 17000) return 3;
+      if (value <= 34000) return 4;
       return 5;
     }
 
-    if (paramNormalized.contains("O3")) {
-      if (valueInUgM3 <= 50) return 0;
-      if (valueInUgM3 <= 100) return 1;
-      if (valueInUgM3 <= 168) return 2;
-      if (valueInUgM3 <= 208) return 3;
-      if (valueInUgM3 <= 748) return 4;
+    if (paramNormalized.contains("CH4")) {
+      // CH4 is in ppb
+      if (value <= 1800) return 0;
+      if (value <= 1850) return 1;
+      if (value <= 1900) return 2;
+      if (value <= 1950) return 3;
+      if (value <= 2000) return 4;
       return 5;
     }
 
@@ -678,7 +682,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                 const SizedBox(height: 10),
                 FadeInUp(
                   child: const Text(
-                    "Real-time data + AI-powered predictions",
+                    "Real-time OpenAQ + AI predictions",
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.white70, fontSize: 16),
                   ),
@@ -878,6 +882,20 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                                   color: Colors.white.withOpacity(0.9),
                                 ),
                               ),
+                              if (_aqiData!["note"] != null &&
+                                  _aqiData!["note"].toString().isNotEmpty)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Text(
+                                    _aqiData!["note"],
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.white.withOpacity(0.8),
+                                      fontStyle: FontStyle.italic,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
                             ],
                           ),
                         ),
@@ -975,6 +993,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                               entry.key,
                               entry.value["value"],
                               entry.value["unit"],
+                              entry.value["source"],
                             ),
                           )
                           .toList(),
@@ -1160,7 +1179,6 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                     ),
                     child: Builder(
                       builder: (context) {
-                        // Merge both sources, prioritizing _trainingResult for metrics
                         final combinedModelInfo = {
                           'model_type':
                               _modelInfo?['model_type'] ??
@@ -1474,8 +1492,13 @@ class _AirAwareHomeState extends State<AirAwareHome> {
     );
   }
 
-  Widget _pollutantCard(String parameter, double value, String unit) {
-    final level = _getAQILevel(parameter, value, unit);
+  Widget _pollutantCard(
+    String parameter,
+    double value,
+    String unit,
+    String? source,
+  ) {
+    final level = _getAQILevel(parameter, value);
     final color = _getColorFromLevel(level);
     final category = _getAQICategoryFromLevel(level);
 
@@ -1487,8 +1510,6 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       icon = Icons.cloud;
     } else if (parameter.toUpperCase().contains('CO')) {
       icon = Icons.smoke_free;
-    } else if (parameter.toUpperCase().contains('O3')) {
-      icon = Icons.wb_sunny;
     } else if (parameter.toUpperCase().contains('CH4')) {
       icon = Icons.local_fire_department;
     }
@@ -1500,56 +1521,78 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       elevation: 4,
       child: Padding(
         padding: const EdgeInsets.all(16.0),
-        child: Row(
+        child: Column(
           children: [
-            Container(
-              width: 50,
-              height: 50,
-              decoration: BoxDecoration(
-                color: color.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(icon, color: color, size: 30),
-            ),
-            const SizedBox(width: 15),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    parameter,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  Text(
-                    category,
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: color,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
+            Row(
               children: [
-                Text(
-                  value.toStringAsFixed(2),
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
+                Container(
+                  width: 50,
+                  height: 50,
+                  decoration: BoxDecoration(
+                    color: color.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(icon, color: color, size: 30),
+                ),
+                const SizedBox(width: 15),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        parameter,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        category,
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: color,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                Text(
-                  unit,
-                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      value.toStringAsFixed(2),
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      unit,
+                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                  ],
                 ),
               ],
             ),
+            if (source != null && source.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Row(
+                  children: [
+                    const Icon(Icons.source, size: 12, color: Colors.grey),
+                    const SizedBox(width: 4),
+                    Text(
+                      source,
+                      style: const TextStyle(
+                        fontSize: 10,
+                        color: Colors.grey,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
           ],
         ),
       ),
@@ -1684,11 +1727,6 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                         'µg/m³',
                       ),
                       _buildPollutantChip(
-                        'O₃',
-                        _safeGetNumber(pred['o3']),
-                        'µg/m³',
-                      ),
-                      _buildPollutantChip(
                         'CH₄',
                         _safeGetNumber(pred['ch4']),
                         'ppb',
@@ -1803,7 +1841,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
             "CH₄ (Methane) Concentration",
             ch4Spots,
             Colors.green,
-            'ppb',
+            'µg/m³',
           ),
         ],
       ),
@@ -1996,7 +2034,6 @@ class HealthTipsScreen extends StatelessWidget {
     if (normalized.contains('NO2')) return 'NO2';
     if (normalized.contains('SO2')) return 'SO2';
     if (normalized.contains('CO') && !normalized.contains('CO2')) return 'CO';
-    if (normalized.contains('O3')) return 'O3';
     if (normalized.contains('CH4')) return 'CH4';
 
     return name;
@@ -2407,13 +2444,11 @@ class HealthTipsScreen extends StatelessWidget {
 class FullScreenMapView extends StatelessWidget {
   final Map<String, dynamic> mapTiles;
   final String cityName;
-  final List<dynamic>? stations;
 
   const FullScreenMapView({
     super.key,
     required this.mapTiles,
     required this.cityName,
-    this.stations,
   });
 
   @override
@@ -2462,33 +2497,6 @@ class FullScreenMapView extends StatelessWidget {
                       size: 50,
                     ),
                   ),
-                  if (stations != null)
-                    ...stations!
-                        .map((station) {
-                          if (station["coordinates"] != null) {
-                            return Marker(
-                              point: LatLng(
-                                station["coordinates"]["latitude"],
-                                station["coordinates"]["longitude"],
-                              ),
-                              width: 35,
-                              height: 35,
-                              child: GestureDetector(
-                                onTap: () {
-                                  _showStationInfo(context, station);
-                                },
-                                child: const Icon(
-                                  Icons.sensors,
-                                  color: Colors.blue,
-                                  size: 30,
-                                ),
-                              ),
-                            );
-                          }
-                          return null;
-                        })
-                        .whereType<Marker>()
-                        .toList(),
                 ],
               ),
             ],
@@ -2558,56 +2566,6 @@ class FullScreenMapView extends StatelessWidget {
         const SizedBox(width: 4),
         Text(label, style: const TextStyle(fontSize: 11)),
       ],
-    );
-  }
-
-  void _showStationInfo(BuildContext context, Map<String, dynamic> station) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(station["name"] ?? "Station"),
-        content: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (station["coordinates"] != null)
-                Text(
-                  "📍 ${station["coordinates"]["latitude"].toStringAsFixed(4)}, ${station["coordinates"]["longitude"].toStringAsFixed(4)}",
-                  style: const TextStyle(fontSize: 12, color: Colors.grey),
-                ),
-              const SizedBox(height: 10),
-              const Text(
-                "Measurements:",
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              if (station["measurements"] != null)
-                ...(station["measurements"] as List).map((m) {
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(m["parameter"] ?? "Unknown"),
-                        Text(
-                          "${m["value"]?.toStringAsFixed(2) ?? 'N/A'} ${m["unit"] ?? ''}",
-                          style: const TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("Close"),
-          ),
-        ],
-      ),
     );
   }
 }

@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sentinel_app/main.dart'; // 👈 adjust if your project name differs
+import 'package:air_aware/main.dart'; // 👈 adjust if your project name differs
 
 void main() {
   testWidgets('Check AirAware app loads with main buttons', (
