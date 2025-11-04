@@ -19,7 +19,7 @@ from pymongo.errors import DuplicateKeyError
 import gridfs
 import tempfile
 import openaq
-from openaq import AuthError, BadRequestError
+from openaq.exceptions import AuthError, BadRequestError
 from datetime import timezone
 
 
