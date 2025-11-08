@@ -59,7 +59,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Map<String, dynamic>? _trainingResult;
 
   // CHANGE THIS TO YOUR SERVER IP
-  final String baseUrl = "https://air-quality-api-etwm.onrender.com/api";
+  final String baseUrl = "http://10.35.37.104:5000/api";
 
   double _normalizeValue(String pollutant, double value, String unit) {
     if (pollutant.toUpperCase().contains('CO')) {
@@ -233,7 +233,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({'city': city}),
           )
-          .timeout(const Duration(seconds: 6000));
+          .timeout(const Duration(seconds: 60000));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -292,7 +292,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
                 'Model accuracy: $accuracy',
               ),
               backgroundColor: Colors.green,
-              duration: const Duration(seconds: 5),
+              duration: const Duration(seconds: 60000),
             ),
           );
         }
@@ -331,7 +331,9 @@ class _AirAwareHomeState extends State<AirAwareHome> {
       final uri = Uri.parse("$baseUrl/air-quality?city=$city");
       debugPrint("🌐 Fetching from: $uri");
 
-      final response = await http.get(uri).timeout(const Duration(seconds: 30));
+      final response = await http
+          .get(uri)
+          .timeout(const Duration(seconds: 60000));
 
       debugPrint("📡 Response status: ${response.statusCode}");
 
@@ -445,7 +447,9 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Future<void> _loadPredictions(String city) async {
     try {
       final uri = Uri.parse("$baseUrl/predict?city=$city");
-      final response = await http.get(uri).timeout(const Duration(seconds: 30));
+      final response = await http
+          .get(uri)
+          .timeout(const Duration(seconds: 60000));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);

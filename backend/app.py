@@ -199,19 +199,29 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
 def fetch_openaq_current_data(lat, lon, radius_km=25):
     """
     Fetch current day air quality data from OpenAQ (real-time).
-    Returns latest measurements for PM2.5, PM10, SO2, NO2, CO near given coordinates.
-    All pollutants are normalized to µg/m³ (CH4 excluded).
+    Returns latest measurements for PM2.5, PM10, SO2, NO2, CO from TODAY ONLY.
+    All pollutants normalized to µg/m³.
+    Compatible with OpenAQ API v3+.
     """
     try:
         print(f"  🌐 Fetching current OpenAQ data...")
 
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        date_from = today_start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        date_to = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        print(f"    📅 Fetching data from {date_from} to {date_to}")
+
+        # Get nearby stations
         locations_response = openaq_client.locations.list(
             coordinates=(lat, lon),
             radius=radius_km * 1000,
             limit=100
         )
 
-        locations = locations_response.results if hasattr(locations_response, "results") else []
+        locations = getattr(locations_response, "results", [])
         print(f"    Found {len(locations)} OpenAQ stations nearby")
 
         if not locations:
@@ -219,6 +229,7 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
             return None
 
         pollutant_values = {}
+        pollutant_timestamps = {}
         target_params = ["pm25", "pm10", "so2", "no2", "co"]
 
         for loc in locations:
@@ -234,79 +245,87 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
 
                     for target in target_params:
                         if target in parameter or target.replace("2", "") in parameter:
+                            # Try both new and old parameter names for backward compatibility
                             try:
-                                measurements = openaq_client.measurements.list(
-                                    sensors_id=sensor_id,  # ✅ FIXED parameter name
-                                    limit=1
-                                )
+                                measurements = None
+                                try:
+                                    # ✅ For OpenAQ v3+ SDK
+                                    measurements = openaq_client.measurements.list(
+                                        sensors_id=sensor_id,
+                                        datetime_from=date_from,
+                                        datetime_to=date_to,
+                                        limit=10
+                                    )
+                                except TypeError:
+                                    # 🔁 For older SDK versions
+                                    measurements = openaq_client.measurements.list(
+                                        sensors_id=sensor_id,
+                                        date_from=date_from,
+                                        date_to=date_to,
+                                        limit=10
+                                    )
 
                                 if measurements and hasattr(measurements, "results") and measurements.results:
-                                    latest = measurements.results[0]
-                                    if hasattr(latest, "value") and latest.value is not None:
-                                        val = latest.value
-                                        unit = getattr(latest, "unit", "").lower() if hasattr(latest, "unit") else ""
+                                    for m in measurements.results:
+                                        if hasattr(m, "value") and m.value is not None:
+                                            val = m.value
+                                            unit = getattr(m, "unit", "").lower()
+                                            timestamp = getattr(getattr(m, "date", {}), "utc", now.isoformat())
 
-                                        # --- Normalize Units ---
-                                        # PM2.5 / PM10 (usually already µg/m³)
-                                        if target in ["pm25", "pm10"]:
-                                            if "mg" in unit:
-                                                val *= 1000  # mg/m³ → µg/m³
-                                                unit = "µg/m³"
-                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³ (converted from mg/m³)")
-                                            else:
-                                                unit = "µg/m³"
-                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³")
-
-                                        # SO2 / NO2 (convert ppb/ppm → µg/m³)
-                                        elif target in ["so2", "no2"]:
-                                            if "ppb" in unit:
-                                                if target == "no2":
-                                                    val *= 1.91  # 1 ppb NO2 ≈ 1.91 µg/m³
-                                                elif target == "so2":
-                                                    val *= 2.62  # 1 ppb SO2 ≈ 2.62 µg/m³
-                                                unit = "µg/m³"
-                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³ (converted from ppb)")
-                                            elif "ppm" in unit:
-                                                if target == "no2":
-                                                    val *= 1910  # 1 ppm NO2 ≈ 1910 µg/m³
-                                                elif target == "so2":
-                                                    val *= 2620  # 1 ppm SO2 ≈ 2620 µg/m³
-                                                unit = "µg/m³"
-                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³ (converted from ppm)")
-                                            else:
-                                                unit = "µg/m³"
-                                                print(f"    ✓ {target.upper()}: {val:.2f} µg/m³")
-
-                                        # CO (convert ppm/mg/m³ → µg/m³)
-                                        elif target == "co":
-                                            if "ppm" in unit:
-                                                val = val * 1.145 * 1000  # ppm → mg/m³ → µg/m³
-                                                unit = "µg/m³"
-                                            elif "mg" in unit:
-                                                val *= 1000  # mg/m³ → µg/m³
-                                                unit = "µg/m³"
-                                            else:
+                                            # --- Normalize Units ---
+                                            if target in ["pm25", "pm10"]:
+                                                if "mg" in unit:
+                                                    val *= 1000
                                                 unit = "µg/m³"
 
-                                        pollutant_values.setdefault(target, []).append(val)
+                                            elif target in ["so2", "no2"]:
+                                                if "ppb" in unit:
+                                                    if target == "no2":
+                                                        val *= 1.91
+                                                    elif target == "so2":
+                                                        val *= 2.62
+                                                elif "ppm" in unit:
+                                                    if target == "no2":
+                                                        val *= 1910
+                                                    elif target == "so2":
+                                                        val *= 2620
+                                                unit = "µg/m³"
+
+                                            elif target == "co":
+                                                if "ppm" in unit:
+                                                    val *= 1.145 * 1000
+                                                elif "mg" in unit:
+                                                    val *= 1000
+                                                unit = "µg/m³"
+
+                                            pollutant_values.setdefault(target, []).append(val)
+                                            pollutant_timestamps.setdefault(target, []).append(timestamp)
 
                             except Exception as e:
                                 print(f"      Error fetching {target} from sensor {sensor_id}: {e}")
-                            break  # move to next sensor once matched
+                            break
 
                 except Exception:
                     continue
 
         # --- Average across all stations ---
-        pollutant_data = {k: float(np.mean(v)) for k, v in pollutant_values.items()}
+        pollutant_data = {}
+        for k, v in pollutant_values.items():
+            pollutant_data[k] = {
+                "value": float(np.mean(v)),
+                "count": len(v),
+                "latest_timestamp": max(pollutant_timestamps[k]) if pollutant_timestamps[k] else None
+            }
 
         if not pollutant_data:
-            print("    ⚠️ No pollutant data retrieved from OpenAQ")
+            print("    ⚠️ No pollutant data retrieved from OpenAQ for today")
             return None
 
-        print("  ✅ Final averaged pollutant values:")
-        for k, v in pollutant_data.items():
-            print(f"     • {k.upper()}: {v:.2f} µg/m³")
+        print("  ✅ Final averaged pollutant values (today only):")
+        for k, data in pollutant_data.items():
+            print(f"     • {k.upper()}: {data['value']:.2f} µg/m³ (avg of {data['count']} measurements)")
+            if data['latest_timestamp']:
+                print(f"       Latest: {data['latest_timestamp']}")
 
         return pollutant_data
 
@@ -314,6 +333,7 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
         print(f"    ❌ OpenAQ current data error: {e}")
         traceback.print_exc()
         return None
+
 
 def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
     """
@@ -1077,14 +1097,16 @@ def fetch_current_air_quality(city_name):
             return {"error": "No real-time OpenAQ data available for this location"}, 404
 
         combined_pollutants = {}
-        for key, value in openaq_current.items():
+        for key, data in openaq_current.items():
             unit = "µg/m³" if key != "ch4" else "ppb"
             combined_pollutants[key.upper()] = {
                 "parameter": key.upper(),
-                "value": value,
+                "value": data["value"],
                 "unit": unit,
                 "source": "OpenAQ (Real-time)",
-                "timestamp": datetime.now().isoformat()
+                "measurement_count": data["count"],
+                "latest_timestamp": data["latest_timestamp"],
+                "data_freshness": "Today only"
             }
 
         # ✅ Still fetch weather & map (non-AQ) from GEE
@@ -1101,8 +1123,8 @@ def fetch_current_air_quality(city_name):
             "pollutants": combined_pollutants,
             "weather": weather_data,
             "map_tiles": map_tiles,
-            "timestamp": datetime.now().isoformat(),
-            "note": "✅ Real-time pollution from OpenAQ only. Weather & satellite tiles from GEE."
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "note": "✅ Real-time pollution from OpenAQ (today only). Weather & satellite tiles from GEE."
         }
 
         return result, 200
@@ -1235,14 +1257,14 @@ def full_analysis():
             "merra_lag_days": MERRA_LAG_DAYS,
             "model_type": "LSTM",
             "data_sources": {
-                "current_pm": "OpenAQ (Real-time)",
+                "current_pm": "OpenAQ (Real-time, today only)",
                 "historical_pm": "OpenAQ (recent) + MERRA-2 (older)",
                 "other_pollutants": "Sentinel-5P",
                 "weather": "ERA5"
             },
             "database": "MongoDB Atlas",
             "prediction_range": "Tomorrow through next 7 days",
-            "note": "PM2.5/PM10 from OpenAQ for current and recent data, MERRA-2 for historical. Other pollutants from Sentinel-5P."
+            "note": "PM2.5/PM10 from OpenAQ for current (today only) and recent data, MERRA-2 for historical. Other pollutants from Sentinel-5P."
         }
     }
     
@@ -1272,7 +1294,7 @@ def health_check():
             "chunk_size": CHUNK_SIZE,
             "model_retraining_days": MODEL_RETRAINING_DAYS,
             "data_sources": {
-                "current_data": "OpenAQ (Real-time)",
+                "current_data": "OpenAQ (Real-time, today only)",
                 "pm_historical": "OpenAQ (recent 2-4 weeks) + MERRA-2 (older)",
                 "other_pollutants": "Sentinel-5P",
                 "weather": "ERA5"
@@ -1324,7 +1346,7 @@ def database_stats():
             "total_records": total_records,
             "total_models": total_models,
             "cities": city_stats,
-            "data_sources": "OpenAQ + GEE (MERRA-2 + Sentinel-5P)",
+            "data_sources": "OpenAQ (real-time, today only) + GEE (MERRA-2 + Sentinel-5P)",
             "data_lag_days": DATA_LAG_DAYS,
             "merra_lag_days": MERRA_LAG_DAYS
         }), 200
@@ -1350,10 +1372,14 @@ def home():
         "database": "MongoDB Atlas",
         "storage": "Persistent (Cloud Database)",
         "data_sources": {
-            "real_time": "OpenAQ API",
+            "real_time": "OpenAQ API (Today only)",
             "historical_pm": "OpenAQ (recent) + MERRA-2 (older)",
             "satellite": "Google Earth Engine (Sentinel-5P)",
             "weather": "ERA5"
+        },
+        "data_freshness": {
+            "current_pollutants": "Real-time from today only",
+            "timestamps_included": "Yes - shows when measurements were taken"
         }
     })
 
@@ -1374,15 +1400,18 @@ if __name__ == "__main__":
     print(f"   • Data Storage: MongoDB Atlas (Persistent Cloud Database)")
     print(f"   • Model Storage: GridFS (MongoDB Binary Storage)")
     print(f"\n🌐 DATA SOURCES:")
-    print(f"   • Current Day PM2.5/PM10: OpenAQ (Real-time ground stations)")
+    print(f"   • Current Day PM2.5/PM10: OpenAQ (Real-time, TODAY ONLY)")
     print(f"   • Recent PM2.5/PM10 (0-{MERRA_LAG_DAYS} days): OpenAQ")
     print(f"   • Historical PM2.5/PM10 (>{MERRA_LAG_DAYS} days): MERRA-2 Satellite")
-    print(f"   • NO2, SO2, CO,  CH4: Sentinel-5P Satellite")
+    print(f"   • NO2, SO2, CO, CH4: Sentinel-5P Satellite")
     print(f"   • Weather Data: ERA5 Reanalysis")
     print(f"\n🔮 PREDICTION CONFIGURATION:")
     print(f"   • Prediction Start: TOMORROW (Day +1 from today)")
     print(f"   • Prediction End: 7 days from today (Day +7)")
     print(f"   • Training uses: OpenAQ + GEE integrated data")
+    print(f"\n✅ IMPROVEMENTS:")
+    print(f"   • Date filtering: Only fetches TODAY's OpenAQ measurements")
+    print(f"   • Timestamp tracking: Shows when each measurement was taken")
+    print(f"   • Data freshness: Includes measurement count and latest timestamp")
     print("="*70 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-
