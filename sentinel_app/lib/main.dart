@@ -59,7 +59,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Map<String, dynamic>? _trainingResult;
 
   // CHANGE THIS TO YOUR SERVER IP
-  final String baseUrl = "http://10.35.37.104:5000/api";
+  final String baseUrl = "https://air-quality-api-etwm.onrender.com/api";
 
   double _normalizeValue(String pollutant, double value, String unit) {
     if (pollutant.toUpperCase().contains('CO')) {
