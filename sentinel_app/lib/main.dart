@@ -447,9 +447,7 @@ class _AirAwareHomeState extends State<AirAwareHome> {
   Future<void> _loadPredictions(String city) async {
     try {
       final uri = Uri.parse("$baseUrl/predict?city=$city");
-      final response = await http
-          .get(uri)
-          .timeout(const Duration(seconds: 60000));
+      final response = await http.get(uri).timeout(const Duration(seconds: 60));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -457,20 +455,46 @@ class _AirAwareHomeState extends State<AirAwareHome> {
         if (data['status'] == 'success') {
           setState(() {
             _predictions = data['predictions'];
-            _modelInfo = data['model_info'];
+
+            // ✅ UPDATED: Get complete model info with training metrics
+            if (data['model_info'] != null) {
+              _modelInfo = {
+                'model_type': data['model_info']['model_type'] ?? 'LSTM',
+                'lookback_days': data['model_info']['lookback_days'],
+                'test_mae': data['model_info']['test_mae'],
+                'test_loss': data['model_info']['test_loss'],
+                'train_mae': data['model_info']['train_mae'],
+                'train_loss': data['model_info']['train_loss'],
+                'training_samples': data['model_info']['training_samples'],
+                'test_samples': data['model_info']['test_samples'],
+                'trained_at': data['model_info']['trained_at'],
+              };
+            }
           });
 
           if (mounted) {
             final accuracy = _calculateModelAccuracy(_modelInfo);
+            final testMae = _safeGetNumber(_modelInfo?['test_mae']);
+            final trainMae = _safeGetNumber(_modelInfo?['train_mae']);
+
+            String message =
+                '✅ Predictions loaded!\n'
+                'Model: ${_modelInfo?['model_type'] ?? 'Unknown'}\n'
+                'Accuracy: $accuracy';
+
+            // Add detailed metrics if available
+            if (testMae > 0) {
+              message +=
+                  '\n\n📊 Performance Metrics:\n'
+                  'Test MAE: ${testMae.toStringAsFixed(2)} µg/m³\n'
+                  'Train MAE: ${trainMae.toStringAsFixed(2)} µg/m³';
+            }
 
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(
-                  '✅ Predictions loaded!\n'
-                  'Model: ${_modelInfo?['model_type'] ?? 'Unknown'}\n'
-                  'Accuracy: $accuracy',
-                ),
+                content: Text(message),
                 backgroundColor: Colors.green,
+                duration: const Duration(seconds: 5),
               ),
             );
           }
@@ -487,7 +511,8 @@ class _AirAwareHomeState extends State<AirAwareHome> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Could not load predictions: $e\n\nTip: Run "Generate Predictions" first to train the model',
+              'Could not load predictions: $e\n\n'
+              'Tip: Run "Generate Predictions" first to train the model',
             ),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 5),

@@ -848,6 +848,10 @@ def predict_next_week(city_name):
         
         if model is None:
             return {"error": f"Model not trained yet for {city_name}. Please train the model first."}, 400
+        
+        # ✅ Get model document for trained_at timestamp
+        model_doc = models_collection.find_one({'city': city_name})
+        trained_at = model_doc['trained_at'].isoformat() if model_doc else None
             
     except Exception as e:
         print(f"  Error loading model: {e}")
@@ -899,6 +903,7 @@ def predict_next_week(city_name):
     
     print(f"  ✅ Generated {len(predictions)} days of predictions (Tomorrow through Next Week)")
     
+    # ✅ UPDATED: Include all model training metrics in response
     return {
         "status": "success",
         "city": city_name,
@@ -908,7 +913,15 @@ def predict_next_week(city_name):
         "predictions": predictions,
         "model_info": {
             "model_type": "lstm",
-            "lookback_days": LOOKBACK_DAYS
+            "lookback_days": LOOKBACK_DAYS,
+            # ✅ NEW: Include training metrics from metadata
+            "test_mae": metadata.get("test_mae") if metadata else None,
+            "test_loss": metadata.get("test_loss") if metadata else None,
+            "train_mae": metadata.get("train_mae") if metadata else None,
+            "train_loss": metadata.get("train_loss") if metadata else None,
+            "training_samples": metadata.get("training_samples") if metadata else None,
+            "test_samples": metadata.get("test_samples") if metadata else None,
+            "trained_at": trained_at
         },
         "note": "Predictions start from tomorrow and extend 7 days into the future"
     }, 200
