@@ -8,6 +8,6 @@ db = client["air_quality_db"]
 collection = db["historical_data"]
 
 # delete all documents where city == "delhi"
-result = collection.delete_many({"city": "Vijayawada"})
+result = collection.delete_many({"city": "Vizag"})
 
 print(f"✅ Deleted {result.deleted_count} documents.")
