@@ -21,17 +21,38 @@ import tempfile
 import openaq
 from datetime import timezone
 
+# ==================== NEW IMPORTS FOR VISUALIZATION ====================
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better-looking plots
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['font.size'] = 10
+
+# Create plots directory
+PLOTS_DIR = 'plots'
+if not os.path.exists(PLOTS_DIR):
+    os.makedirs(PLOTS_DIR)
+    print(f"✅ Created plots directory: {PLOTS_DIR}")
+
+# ========================================================================
 
 load_dotenv()
 
 # --- Calibration Factors (Ground to Satellite) ---
 CALIBRATION_FACTORS = {
-    'pm25': 0.68,  # Refined based on MERRA-2 vs ground station studies
-    'pm10': 0.72,  # Better vertical profile understanding
-    'no2': 0.62,   # Tropospheric column vs surface
-    'so2': 0.58,   # Strong near-surface emissions
-    'co': 0.52,    # Largest vertical gradient
-    'ch4': 0.96    # Nearly uniform vertical distribution
+    'pm25': 0.68,
+    'pm10': 0.72,
+    'no2': 0.62,
+    'so2': 0.58,
+    'co': 0.52,
+    'ch4': 0.96
 }
 
 # --- MongoDB Configuration ---
@@ -48,7 +69,6 @@ try:
     fs = gridfs.GridFS(db)
     print("✅ MongoDB Atlas connected successfully")
     
-    # Create indexes
     historical_collection.create_index([("city", ASCENDING), ("date", ASCENDING)], unique=True)
     historical_collection.create_index([("city", ASCENDING)])
     historical_collection.create_index([("date", ASCENDING)])
@@ -86,13 +106,279 @@ app = Flask(__name__)
 
 # --- Configuration ---
 DATA_LAG_DAYS = 30
-MERRA_LAG_DAYS = 25  # MERRA-2 typical lag is 2-4 weeks
+MERRA_LAG_DAYS = 25
 DAYS_BACK = 1455
 LOOKBACK_DAYS = 90
 MODEL_RETRAINING_DAYS = 7
 CHUNK_SIZE = 30
 
 geolocator = Nominatim(user_agent="air-quality-gee")
+
+# ==================== VISUALIZATION FUNCTIONS ====================
+
+def plot_training_history(history, city_name, save_path=None):
+    """Plot training and validation loss/MAE over epochs"""
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Loss plot
+    axes[0].plot(history.history['loss'], label='Training Loss', linewidth=2)
+    axes[0].plot(history.history['val_loss'], label='Validation Loss', linewidth=2)
+    axes[0].set_title(f'Model Loss - {city_name}', fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss (MSE)', fontsize=12)
+    axes[0].legend(fontsize=11)
+    axes[0].grid(True, alpha=0.3)
+    
+    # MAE plot
+    axes[1].plot(history.history['mae'], label='Training MAE', linewidth=2)
+    axes[1].plot(history.history['val_mae'], label='Validation MAE', linewidth=2)
+    axes[1].set_title(f'Model MAE - {city_name}', fontsize=14, fontweight='bold')
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Mean Absolute Error', fontsize=12)
+    axes[1].legend(fontsize=11)
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path is None:
+        save_path = os.path.join(PLOTS_DIR, f'{city_name}_training_history.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Saved training history plot: {save_path}")
+    return save_path
+
+def plot_predictions_vs_actual(y_true, y_pred, city_name, pollutants, save_path=None):
+    """Plot predicted vs actual values for all pollutants"""
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.flatten()
+    
+    for idx, pollutant in enumerate(pollutants):
+        if idx < len(axes):
+            ax = axes[idx]
+            
+            # Scatter plot
+            ax.scatter(y_true[:, idx], y_pred[:, idx], alpha=0.5, s=20)
+            
+            # Perfect prediction line
+            min_val = min(y_true[:, idx].min(), y_pred[:, idx].min())
+            max_val = max(y_true[:, idx].max(), y_pred[:, idx].max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect Prediction')
+            
+            # Calculate metrics
+            mse = mean_squared_error(y_true[:, idx], y_pred[:, idx])
+            mae = mean_absolute_error(y_true[:, idx], y_pred[:, idx])
+            r2 = r2_score(y_true[:, idx], y_pred[:, idx])
+            
+            ax.set_title(f'{pollutant.upper()}\nR²={r2:.3f}, MAE={mae:.3f}', fontsize=11, fontweight='bold')
+            ax.set_xlabel('Actual Values', fontsize=10)
+            ax.set_ylabel('Predicted Values', fontsize=10)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
+    
+    # Hide unused subplots
+    for idx in range(len(pollutants), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle(f'Predictions vs Actual Values - {city_name}', fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    
+    if save_path is None:
+        save_path = os.path.join(PLOTS_DIR, f'{city_name}_predictions_vs_actual.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Saved predictions vs actual plot: {save_path}")
+    return save_path
+
+def plot_error_distribution(y_true, y_pred, city_name, pollutants, save_path=None):
+    """Plot error distribution for all pollutants"""
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.flatten()
+    
+    for idx, pollutant in enumerate(pollutants):
+        if idx < len(axes):
+            ax = axes[idx]
+            
+            errors = y_pred[:, idx] - y_true[:, idx]
+            
+            # Histogram
+            ax.hist(errors, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
+            
+            # Add mean line
+            mean_error = np.mean(errors)
+            ax.axvline(mean_error, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_error:.3f}')
+            ax.axvline(0, color='green', linestyle='-', linewidth=2, label='Zero Error')
+            
+            ax.set_title(f'{pollutant.upper()} Error Distribution', fontsize=11, fontweight='bold')
+            ax.set_xlabel('Prediction Error', fontsize=10)
+            ax.set_ylabel('Frequency', fontsize=10)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+    
+    # Hide unused subplots
+    for idx in range(len(pollutants), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle(f'Error Distribution - {city_name}', fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    
+    if save_path is None:
+        save_path = os.path.join(PLOTS_DIR, f'{city_name}_error_distribution.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Saved error distribution plot: {save_path}")
+    return save_path
+
+def plot_time_series_comparison(dates, y_true, y_pred, city_name, pollutants, save_path=None):
+    """Plot time series comparison for test set"""
+    fig, axes = plt.subplots(4, 2, figsize=(18, 16))
+    axes = axes.flatten()
+    
+    # Use last N points for clearer visualization
+    n_points = min(100, len(dates))
+    
+    for idx, pollutant in enumerate(pollutants[:7]):  # Only first 7 pollutants
+        if idx < len(axes):
+            ax = axes[idx]
+            
+            ax.plot(dates[-n_points:], y_true[-n_points:, idx], 
+                   label='Actual', linewidth=2, marker='o', markersize=3, alpha=0.7)
+            ax.plot(dates[-n_points:], y_pred[-n_points:, idx], 
+                   label='Predicted', linewidth=2, marker='s', markersize=3, alpha=0.7)
+            
+            ax.set_title(f'{pollutant.upper()} - Time Series', fontsize=11, fontweight='bold')
+            ax.set_xlabel('Date', fontsize=10)
+            ax.set_ylabel('Value', fontsize=10)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+    
+    plt.suptitle(f'Time Series Comparison (Last {n_points} Points) - {city_name}', 
+                 fontsize=16, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    
+    if save_path is None:
+        save_path = os.path.join(PLOTS_DIR, f'{city_name}_time_series_comparison.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Saved time series comparison plot: {save_path}")
+    return save_path
+
+def plot_metrics_summary(metrics_dict, city_name, save_path=None):
+    """Plot summary of all metrics in a bar chart"""
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    pollutants = list(metrics_dict.keys())
+    
+    # MAE
+    mae_values = [metrics_dict[p]['mae'] for p in pollutants]
+    axes[0, 0].bar(pollutants, mae_values, color='steelblue', alpha=0.7, edgecolor='black')
+    axes[0, 0].set_title('Mean Absolute Error (MAE)', fontsize=13, fontweight='bold')
+    axes[0, 0].set_ylabel('MAE', fontsize=11)
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    axes[0, 0].grid(True, alpha=0.3, axis='y')
+    
+    # RMSE
+    rmse_values = [metrics_dict[p]['rmse'] for p in pollutants]
+    axes[0, 1].bar(pollutants, rmse_values, color='coral', alpha=0.7, edgecolor='black')
+    axes[0, 1].set_title('Root Mean Squared Error (RMSE)', fontsize=13, fontweight='bold')
+    axes[0, 1].set_ylabel('RMSE', fontsize=11)
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    axes[0, 1].grid(True, alpha=0.3, axis='y')
+    
+    # R² Score
+    r2_values = [metrics_dict[p]['r2'] for p in pollutants]
+    axes[1, 0].bar(pollutants, r2_values, color='seagreen', alpha=0.7, edgecolor='black')
+    axes[1, 0].set_title('R² Score', fontsize=13, fontweight='bold')
+    axes[1, 0].set_ylabel('R²', fontsize=11)
+    axes[1, 0].axhline(y=0, color='red', linestyle='--', linewidth=2)
+    axes[1, 0].tick_params(axis='x', rotation=45)
+    axes[1, 0].grid(True, alpha=0.3, axis='y')
+    
+    # MAPE
+    mape_values = [metrics_dict[p]['mape'] for p in pollutants]
+    axes[1, 1].bar(pollutants, mape_values, color='mediumpurple', alpha=0.7, edgecolor='black')
+    axes[1, 1].set_title('Mean Absolute Percentage Error (MAPE)', fontsize=13, fontweight='bold')
+    axes[1, 1].set_ylabel('MAPE (%)', fontsize=11)
+    axes[1, 1].tick_params(axis='x', rotation=45)
+    axes[1, 1].grid(True, alpha=0.3, axis='y')
+    
+    plt.suptitle(f'Model Performance Metrics - {city_name}', fontsize=16, fontweight='bold', y=1.00)
+    plt.tight_layout()
+    
+    if save_path is None:
+        save_path = os.path.join(PLOTS_DIR, f'{city_name}_metrics_summary.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Saved metrics summary plot: {save_path}")
+    return save_path
+
+def plot_residuals(y_true, y_pred, city_name, pollutants, save_path=None):
+    """Plot residual plots for all pollutants"""
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.flatten()
+    
+    for idx, pollutant in enumerate(pollutants):
+        if idx < len(axes):
+            ax = axes[idx]
+            
+            residuals = y_pred[:, idx] - y_true[:, idx]
+            
+            # Residual plot
+            ax.scatter(y_pred[:, idx], residuals, alpha=0.5, s=20)
+            ax.axhline(y=0, color='red', linestyle='--', linewidth=2)
+            
+            ax.set_title(f'{pollutant.upper()} Residuals', fontsize=11, fontweight='bold')
+            ax.set_xlabel('Predicted Values', fontsize=10)
+            ax.set_ylabel('Residuals', fontsize=10)
+            ax.grid(True, alpha=0.3)
+    
+    # Hide unused subplots
+    for idx in range(len(pollutants), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle(f'Residual Plots - {city_name}', fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    
+    if save_path is None:
+        save_path = os.path.join(PLOTS_DIR, f'{city_name}_residuals.png')
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  📊 Saved residual plot: {save_path}")
+    return save_path
+
+def calculate_detailed_metrics(y_true, y_pred, pollutants):
+    """Calculate detailed metrics for each pollutant"""
+    metrics = {}
+    
+    for idx, pollutant in enumerate(pollutants):
+        y_t = y_true[:, idx]
+        y_p = y_pred[:, idx]
+        
+        mae = mean_absolute_error(y_t, y_p)
+        mse = mean_squared_error(y_t, y_p)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_t, y_p)
+        
+        # MAPE (avoid division by zero)
+        mape = np.mean(np.abs((y_t - y_p) / (y_t + 1e-8))) * 100
+        
+        metrics[pollutant] = {
+            'mae': float(mae),
+            'mse': float(mse),
+            'rmse': float(rmse),
+            'r2': float(r2),
+            'mape': float(mape)
+        }
+    
+    return metrics
+
+# ========================================================================
 
 def get_coordinates(city_name):
     """Get (latitude, longitude) of a city using Nominatim."""
@@ -109,16 +395,7 @@ def get_coordinates(city_name):
         return None
 
 def calibrate_to_satellite(value, pollutant_key):
-    """
-    Calibrate ground-level measurements to satellite-equivalent values.
-    
-    Args:
-        value: Ground-level measurement value
-        pollutant_key: Pollutant identifier (pm25, pm10, no2, so2, co, ch4)
-    
-    Returns:
-        Calibrated value representing satellite-equivalent measurement
-    """
+    """Calibrate ground-level measurements to satellite-equivalent values."""
     if value is None:
         return None
     
@@ -128,17 +405,13 @@ def calibrate_to_satellite(value, pollutant_key):
     return calibrated
 
 def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
-    """
-    Fetch PM2.5 and PM10 data from OpenAQ for the specified date range.
-    This is used to fill in the gap when MERRA-2 data is not available (recent 2-4 weeks).
-    """
+    """Fetch PM2.5 and PM10 data from OpenAQ for the specified date range."""
     try:
         print(f"  🌐 Fetching OpenAQ PM data from {start_date.date()} to {end_date.date()}...")
         
-        # Get nearby locations
         locations_response = openaq_client.locations.list(
             coordinates=(lat, lon),
-            radius=radius_km * 1000,  # Convert km to meters
+            radius=radius_km * 1000,
             limit=100
         )
         
@@ -152,7 +425,6 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
         pm25_values = []
         pm10_values = []
         
-        # Convert dates to ISO format for OpenAQ API
         date_from = start_date.strftime('%Y-%m-%dT00:00:00Z')
         date_to = end_date.strftime('%Y-%m-%dT23:59:59Z')
         
@@ -166,7 +438,6 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
                     parameter_lower = parameter.lower()
                     sensor_id = sensor.id
                     
-                    # Fetch PM2.5
                     if 'pm25' in parameter_lower or 'pm2.5' in parameter_lower:
                         try:
                             measurements = openaq_client.measurements.list(
@@ -183,7 +454,6 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
                         except Exception as e:
                             print(f"      Error fetching PM2.5 from sensor {sensor_id}: {e}")
                     
-                    # Fetch PM10
                     elif 'pm10' in parameter_lower:
                         try:
                             measurements = openaq_client.measurements.list(
@@ -213,7 +483,6 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
             result['pm10'] = np.mean(pm10_values)
             print(f"    ✓ PM10 from OpenAQ: {result['pm10']:.2f} µg/m³ (avg of {len(pm10_values)} measurements)")
         
-        # If we have PM2.5 but not PM10, estimate PM10
         if 'pm25' in result and 'pm10' not in result:
             result['pm10'] = result['pm25'] * 1.8
             print(f"    ℹ️ PM10 estimated from PM2.5: {result['pm10']:.2f} µg/m³")
@@ -225,57 +494,22 @@ def fetch_openaq_pm_data(lat, lon, start_date, end_date, radius_km=25):
         traceback.print_exc()
         return None
 
-import traceback
-from datetime import datetime, timezone
-import numpy as np
-
-# --- Corrected calibration factors (ground -> satellite-equivalent) ---
-CALIBRATION_FACTORS = {
-    'pm25': 0.68,   # acceptable
-    'pm10': 0.82,   # corrected (higher than pm25)
-    'no2': 0.62,    # acceptable
-    'so2': 0.50,    # corrected (lower)
-    'co': 0.46,     # corrected (lower)
-    'ch4': 0.99     # nearly uniform vertical profile
-}
-
-def calibrate_to_satellite(ground_value, pollutant):
-    """
-    Convert ground-level averaged value to a satellite-equivalent (column)
-    using simple multiplicative calibration factor. Returns calibrated value.
-    """
-    factor = CALIBRATION_FACTORS.get(pollutant, 1.0)
-    try:
-        return float(ground_value) * float(factor)
-    except Exception:
-        return float(ground_value)  # fallback to identity
-
 def _normalize_unit_value(val, unit, target):
-    """
-    Normalize measurement `val` from `unit` to µg/m³ for the target pollutant.
-    Accepts common unit spellings/variants and is defensive.
-    """
+    """Normalize measurement `val` from `unit` to µg/m³ for the target pollutant."""
     if val is None:
         return None
 
-    # normalize unit string
     unit_s = (unit or "").strip().lower()
-
-    # common synonyms
     unit_s = unit_s.replace("ug/m3", "µg/m³").replace("ug/m³", "µg/m³").replace("ug/m^3", "µg/m³")
 
-    # PM handling: mg -> µg
     if target in ["pm25", "pm10"]:
         if "mg" in unit_s and "m3" in unit_s:
             return float(val) * 1000.0
-        # assume if already µg/m³ or "µg/m3"
         return float(val)
 
-    # NO2 and SO2: ppb/ppm -> µg/m³ using molecular weights
-    # Conversions assumed at 25°C and 1 atm
     if target == "no2":
         if "ppb" in unit_s:
-            return float(val) * 1.88  # µg/m³ per ppb for NO2
+            return float(val) * 1.88
         if "ppm" in unit_s:
             return float(val) * 1880.0
         if "µg" in unit_s or "ug" in unit_s:
@@ -283,48 +517,30 @@ def _normalize_unit_value(val, unit, target):
 
     if target == "so2":
         if "ppb" in unit_s:
-            return float(val) * 2.62  # µg/m³ per ppb for SO2
+            return float(val) * 2.62
         if "ppm" in unit_s:
             return float(val) * 2620.0
         if "µg" in unit_s or "ug" in unit_s:
             return float(val)
 
-    # CO conversions
     if target == "co":
-        # 1 ppm CO ≈ 1145 µg/m³ at 25°C, 1 atm
         if "ppm" in unit_s:
             return float(val) * 1145.0
-        # if provided as mg/m3 -> µg/m3
         if "mg" in unit_s and "m3" in unit_s:
             return float(val) * 1000.0
         if "µg" in unit_s or "ug" in unit_s:
             return float(val)
 
-    # CH4 (if ever present here) - convert ppb to µg/m3 if needed (user earlier uses ppb for CH4)
     if target == "ch4":
-        # CH4 conversions not typically used here — keep as raw for caller (or implement if needed)
         return float(val)
 
-    # fallback: return raw float
     try:
         return float(val)
     except Exception:
         return None
 
 def fetch_openaq_current_data(lat, lon, radius_km=25):
-    """
-    Fetch current day air quality data from OpenAQ (real-time).
-    Returns latest measurements for PM2.5, PM10, SO2, NO2, CO from TODAY ONLY.
-    All pollutants normalized to µg/m³ and CALIBRATED to satellite-equivalent values.
-    Compatible with OpenAQ API v3+.
-
-    Returns:
-        dict or None with structure:
-        {
-          'pm25': {'value': <satellite_equiv µg/m³>, 'ground_value': <µg/m³>, 'calibration_factor': <float>, 'count': <int>, 'latest_timestamp': <str>},
-          ...
-        }
-    """
+    """Fetch current day air quality data from OpenAQ (real-time)."""
     try:
         print(f"  🌐 Fetching current OpenAQ data...")
 
@@ -336,7 +552,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
 
         print(f"    📅 Fetching data from {date_from} to {date_to}")
 
-        # Get nearby stations (defensive - client SDK variations)
         try:
             locations_response = openaq_client.locations.list(
                 coordinates=(lat, lon),
@@ -345,7 +560,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
             )
             locations = getattr(locations_response, "results", []) or []
         except Exception:
-            # fallback if signature differs
             locations_response = openaq_client.locations(list=True, coordinates=(lat, lon), radius=radius_km*1000, limit=100)
             locations = getattr(locations_response, "results", []) or []
 
@@ -355,35 +569,29 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
             print("    ⚠️ No OpenAQ stations found nearby")
             return None
 
-        pollutant_values = {}       # raw (normalized to µg/m³) lists per pollutant
-        pollutant_timestamps = {}   # timestamps per pollutant
+        pollutant_values = {}
+        pollutant_timestamps = {}
         target_params = ["pm25", "pm10", "so2", "no2", "co"]
 
         for loc in locations:
-            # 'sensors' may be located under different keys depending on SDK; be defensive
             sensors = getattr(loc, "sensors", None) or getattr(loc, "parameters", None) or []
             if not sensors:
-                # some SDK return station-level lastMeasurements - ignore here
                 continue
 
             for sensor in sensors:
                 try:
-                    # parameter may appear differently in different SDK versions/structures
                     param_name = ""
                     if hasattr(sensor, "parameter"):
                         param_name = getattr(sensor.parameter, "name", "") or getattr(sensor.parameter, "parameter", "")
-                    # some SDKs give parameter directly as string
                     if not param_name:
                         param_name = getattr(sensor, "name", "") or getattr(sensor, "parameter", "")
                     parameter = (param_name or "").lower().strip()
 
-                    # Best to match exact parameter names used by OpenAQ
                     if parameter not in target_params:
                         continue
 
                     sensor_id = getattr(sensor, "id", None) or getattr(sensor, "sensor_id", None) or None
-                    # for some SDKs sensor object may not have id, but location-level measurements exist -> we'll try measurements by parameter later
-                    # Try retrieving measurements for this sensor (if id exists), else try measurements by location and parameter
+                    
                     for target in target_params:
                         if parameter != target:
                             continue
@@ -391,7 +599,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                         measurements = None
                         try:
                             if sensor_id:
-                                # Try modern SDK call
                                 measurements = openaq_client.measurements.list(
                                     sensors_id=sensor_id,
                                     datetime_from=date_from,
@@ -399,7 +606,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                                     limit=20
                                 )
                             else:
-                                # fallback: query by location id and parameter
                                 loc_id = getattr(loc, "id", None) or getattr(loc, "locationId", None) or None
                                 if loc_id:
                                     measurements = openaq_client.measurements.list(
@@ -410,7 +616,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                                         limit=20
                                     )
                         except TypeError:
-                            # older SDK signature differences
                             try:
                                 measurements = openaq_client.measurements.list(
                                     sensors_id=sensor_id,
@@ -429,11 +634,10 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                         results = getattr(measurements, "results", []) or []
                         for m in results:
                             try:
-                                # Value, unit, timestamp extraction - be defensive to SDK structure
                                 val = getattr(m, "value", None) if hasattr(m, "value") else m.get("value") if isinstance(m, dict) else None
                                 unit = getattr(m, "unit", None) if hasattr(m, "unit") else m.get("unit") if isinstance(m, dict) else ""
                                 date_obj = getattr(m, "date", None) or (m.get("date") if isinstance(m, dict) else None)
-                                # date.utc or date.local depending on SDK
+                                
                                 timestamp = None
                                 if getattr(date_obj, "utc", None):
                                     timestamp = date_obj.utc
@@ -444,7 +648,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                                 else:
                                     timestamp = now.isoformat()
 
-                                # Normalize to µg/m³ where applicable
                                 normalized = _normalize_unit_value(val, unit, target)
                                 if normalized is None:
                                     continue
@@ -452,13 +655,11 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                                 pollutant_values.setdefault(target, []).append(normalized)
                                 pollutant_timestamps.setdefault(target, []).append(timestamp)
                             except Exception:
-                                # skip single measurement error
                                 continue
 
                 except Exception:
                     continue
 
-        # --- Average across all stations and CALIBRATE to satellite values ---
         pollutant_data = {}
         for k, vals in pollutant_values.items():
             if not vals:
@@ -489,7 +690,6 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
                 if data['latest_timestamp']:
                     print(f"       Latest: {data['latest_timestamp']}")
             except Exception:
-                # safe print fallback
                 print(f"     • {k.upper()}: {data}")
 
         return pollutant_data
@@ -499,13 +699,8 @@ def fetch_openaq_current_data(lat, lon, radius_km=25):
         traceback.print_exc()
         return None
 
-
 def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
-    """
-    Fetch pollutant data from Google Earth Engine with OpenAQ fallback for PM data.
-    All pollutants converted to µg/m³ for consistency (except CH4 → ppb).
-    """
-
+    """Fetch pollutant data from Google Earth Engine with OpenAQ fallback for PM data."""
     if not GEE_AVAILABLE:
         print("❌ GEE is not available or initialized.")
         return None
@@ -518,11 +713,8 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         end = ee.Date(end_date.strftime('%Y-%m-%d'))
 
         pollutant_data = {}
-        TROPOSPHERIC_HEIGHT_M = 8000  # assumed layer depth for column → concentration conversion
+        TROPOSPHERIC_HEIGHT_M = 8000
 
-        # -------------------------
-        # PM2.5 / PM10 (OpenAQ → MERRA fallback)
-        # -------------------------
         days_ago = (datetime.now() - end_date).days
         use_openaq_for_pm = days_ago < MERRA_LAG_DAYS
 
@@ -566,9 +758,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
             except Exception as e:
                 print(f"⚠️ MERRA-2 PM error: {e}")
 
-        # -------------------------
-        # NO2
-        # -------------------------
         try:
             no2 = (
                 ee.ImageCollection("COPERNICUS/S5P/NRTI/L3_NO2")
@@ -593,9 +782,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         except Exception as e:
             print(f"⚠️ NO2 error: {e}")
 
-        # -------------------------
-        # SO2
-        # -------------------------
         try:
             so2 = (
                 ee.ImageCollection("COPERNICUS/S5P/NRTI/L3_SO2")
@@ -620,9 +806,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         except Exception as e:
             print(f"⚠️ SO2 error: {e}")
 
-        # -------------------------
-        # CO
-        # -------------------------
         try:
             co = (
                 ee.ImageCollection("COPERNICUS/S5P/NRTI/L3_CO")
@@ -645,9 +828,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         except Exception as e:
             print(f"⚠️ CO error: {e}")
 
-        # -------------------------
-        # CH4 (ppb)
-        # -------------------------
         try:
             ch4_collection = (
                 ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_CH4")
@@ -664,11 +844,10 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
                 raw = val.get("CH4_column_volume_mixing_ratio_dry_air")
 
                 if raw is not None:
-                    # fix incorrect scaling
-                    if raw > 1e-3:  # value too large → divide by 1e6
+                    if raw > 1e-3:
                         raw = raw / 1e6
 
-                    pollutant_data["ch4"] = raw * 1e9  # mol/mol to ppb
+                    pollutant_data["ch4"] = raw * 1e9
 
                     print(f"  ✓ CH4: {pollutant_data['ch4']:.2f} ppb")
 
@@ -681,7 +860,6 @@ def fetch_gee_pollutant_data(lat, lon, start_date, end_date, radius_km=50):
         print(f"❌ Error fetching GEE pollutant data: {e}")
         traceback.print_exc()
         return None
-
 
 def fetch_gee_weather_data(lat, lon, start_date, end_date):
     """Fetch weather data from Google Earth Engine (ERA5 reanalysis data)"""
@@ -787,7 +965,7 @@ def fetch_gee_weather_data(lat, lon, start_date, end_date):
         return None
 
 def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
-    """Fetch historical pollutant and weather data from GEE and OpenAQ, store in MongoDB (all pollutants in µg/m³)."""
+    """Fetch historical pollutant and weather data from GEE and OpenAQ, store in MongoDB."""
     coords = get_coordinates(city_name)
     if not coords:
         return {"error": f"Could not find coordinates for {city_name}"}, 404
@@ -842,7 +1020,6 @@ def fetch_historical_gee_data(city_name, days_back=DAYS_BACK):
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}, 500
-
 
 def prepare_lstm_data(city_name):
     """Prepare data for LSTM training from MongoDB"""
@@ -966,7 +1143,7 @@ def load_model_from_mongodb(city_name):
         return None, None, None
 
 def train_lstm_model(city_name, force_retrain=False):
-    """Train LSTM model for air quality prediction"""
+    """Train LSTM model for air quality prediction with visualization"""
     print(f"\n🤖 Training LSTM model for {city_name}...")
     
     if not force_retrain:
@@ -1037,6 +1214,43 @@ def train_lstm_model(city_name, force_retrain=False):
         verbose=1
     )
     
+    # ==================== GENERATE VISUALIZATIONS ====================
+    print("\n📊 Generating visualizations...")
+    
+    # 1. Training history plot
+    plot_training_history(history, city_name)
+    
+    # 2. Make predictions for test set
+    y_train_pred = model.predict(X_train, verbose=0)
+    y_test_pred = model.predict(X_test, verbose=0)
+    
+    # 3. Predictions vs Actual
+    plot_predictions_vs_actual(y_test, y_test_pred, city_name, 
+                               ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4', 'combined'])
+    
+    # 4. Error distribution
+    plot_error_distribution(y_test, y_test_pred, city_name,
+                           ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4', 'combined'])
+    
+    # 5. Residual plots
+    plot_residuals(y_test, y_test_pred, city_name,
+                  ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4', 'combined'])
+    
+    # 6. Time series comparison
+    test_dates = df['date'].iloc[-len(y_test):].values
+    plot_time_series_comparison(test_dates, y_test, y_test_pred, city_name,
+                                ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4', 'combined'])
+    
+    # 7. Calculate detailed metrics
+    pollutants = ['pm25', 'pm10', 'so2', 'no2', 'co', 'ch4', 'combined']
+    metrics = calculate_detailed_metrics(y_test, y_test_pred, pollutants)
+    
+    # 8. Metrics summary plot
+    plot_metrics_summary(metrics, city_name)
+    
+    print("✅ All visualizations saved to plots/ directory")
+    # ================================================================
+    
     train_loss, train_mae = model.evaluate(X_train, y_train, verbose=0)
     test_loss, test_mae = model.evaluate(X_test, y_test, verbose=0)
     
@@ -1051,7 +1265,16 @@ def train_lstm_model(city_name, force_retrain=False):
         'test_mae': float(test_mae),
         'training_samples': len(X_train),
         'test_samples': len(X_test),
-        'lookback_days': LOOKBACK_DAYS
+        'lookback_days': LOOKBACK_DAYS,
+        'detailed_metrics': metrics,
+        'plots_generated': [
+            f'{city_name}_training_history.png',
+            f'{city_name}_predictions_vs_actual.png',
+            f'{city_name}_error_distribution.png',
+            f'{city_name}_residuals.png',
+            f'{city_name}_time_series_comparison.png',
+            f'{city_name}_metrics_summary.png'
+        ]
     }
     
     save_model_to_mongodb(city_name, model, scaler, metadata)
@@ -1074,7 +1297,6 @@ def predict_next_week(city_name):
         if model is None:
             return {"error": f"Model not trained yet for {city_name}. Please train the model first."}, 400
         
-        # ✅ Get model document for trained_at timestamp
         model_doc = models_collection.find_one({'city': city_name})
         trained_at = model_doc['trained_at'].isoformat() if model_doc else None
             
@@ -1199,7 +1421,6 @@ def generate_map_tiles(lat, lon, radius_km=100):
         
         pollutants_data = {}
         
-        # NO2
         try:
             no2_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_NO2') \
                 .filterDate(start_date, end_date) \
@@ -1212,7 +1433,6 @@ def generate_map_tiles(lat, lon, radius_km=100):
         except Exception as e:
             print(f"  ✗ NO2 error: {e}")
         
-        # SO2
         try:
             so2_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_SO2') \
                 .filterDate(start_date, end_date) \
@@ -1225,7 +1445,6 @@ def generate_map_tiles(lat, lon, radius_km=100):
         except Exception as e:
             print(f"  ✗ SO2 error: {e}")
         
-        # CO
         try:
             co_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_CO') \
                 .filterDate(start_date, end_date) \
@@ -1238,7 +1457,6 @@ def generate_map_tiles(lat, lon, radius_km=100):
         except Exception as e:
             print(f"  ✗ CO error: {e}")
         
-        # Aerosol Index
         try:
             aer_collection = ee.ImageCollection('COPERNICUS/S5P/NRTI/L3_AER_AI') \
                 .filterDate(start_date, end_date) \
@@ -1325,7 +1543,6 @@ def fetch_current_air_quality(city_name):
 
         print(f"\n📊 Fetching current air quality for {city_name}...")
 
-        # ✅ Fetch ONLY today's AQ data from OpenAQ with calibration
         print(f"  🌐 Fetching current day data from OpenAQ...")
         openaq_current = fetch_openaq_current_data(latitude, longitude)
 
@@ -1337,8 +1554,8 @@ def fetch_current_air_quality(city_name):
             unit = "µg/m³" if key != "ch4" else "ppb"
             combined_pollutants[key.upper()] = {
                 "parameter": key.upper(),
-                "value": data["value"],  # Already calibrated to satellite-equivalent
-                "ground_value": data["ground_value"],  # Original ground measurement
+                "value": data["value"],
+                "ground_value": data["ground_value"],
                 "calibration_factor": data["calibration_factor"],
                 "unit": unit,
                 "source": "OpenAQ (Real-time, calibrated to satellite-equivalent)",
@@ -1348,7 +1565,6 @@ def fetch_current_air_quality(city_name):
                 "note": f"Ground value ({data['ground_value']:.2f}) multiplied by {data['calibration_factor']:.2f} to match satellite data"
             }
 
-        # ✅ Still fetch weather & map (non-AQ) from GEE
         safe_end_date = datetime.now() - timedelta(days=DATA_LAG_DAYS)
         start_date = safe_end_date - timedelta(days=7)
 
@@ -1377,7 +1593,6 @@ def fetch_current_air_quality(city_name):
         print(f"❌ Error fetching current data: {e}")
         traceback.print_exc()
         return {"error": str(e)}, 500
-
 
 # --- Flask API Endpoints ---
 
@@ -1490,6 +1705,8 @@ def full_analysis():
             "training_samples": train_result.get("training_samples"),
             "test_samples": train_result.get("test_samples"),
             "lookback_days": train_result.get("lookback_days", LOOKBACK_DAYS),
+            "detailed_metrics": train_result.get("detailed_metrics"),
+            "plots_generated": train_result.get("plots_generated"),
             "message": train_result.get("message", "Model training completed")
         },
         "predictions": pred_result,
@@ -1509,6 +1726,7 @@ def full_analysis():
             },
             "database": "MongoDB Atlas",
             "prediction_range": "Tomorrow through next 7 days",
+            "visualizations": "All plots saved to plots/ directory",
             "note": "Current air quality values are calibrated from ground-level to satellite-equivalent for consistency with predictions."
         }
     }
@@ -1533,6 +1751,8 @@ def health_check():
         "service": "Air Quality API with LSTM Predictions (GEE + OpenAQ + MongoDB)",
         "calibration_enabled": True,
         "calibration_factors": CALIBRATION_FACTORS,
+        "visualizations_enabled": True,
+        "plots_directory": PLOTS_DIR,
         "configuration": {
             "days_back": DAYS_BACK,
             "data_lag_days": DATA_LAG_DAYS,
@@ -1596,7 +1816,8 @@ def database_stats():
             "data_sources": "OpenAQ (real-time, calibrated) + GEE (MERRA-2 + Sentinel-5P)",
             "data_lag_days": DATA_LAG_DAYS,
             "merra_lag_days": MERRA_LAG_DAYS,
-            "calibration_enabled": True
+            "calibration_enabled": True,
+            "visualizations_enabled": True
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1616,11 +1837,13 @@ def model_status():
 def home():
     return jsonify({
         "status": "success",
-        "message": "✅ Flask backend with MongoDB Atlas, OpenAQ, and Calibration is running successfully!",
+        "message": "✅ Flask backend with MongoDB Atlas, OpenAQ, Calibration, and Visualizations is running successfully!",
         "database": "MongoDB Atlas",
         "storage": "Persistent (Cloud Database)",
         "calibration_enabled": True,
         "calibration_factors": CALIBRATION_FACTORS,
+        "visualizations_enabled": True,
+        "plots_directory": PLOTS_DIR,
         "data_sources": {
             "real_time": "OpenAQ API (Today only, CALIBRATED)",
             "historical_pm": "OpenAQ (recent) + MERRA-2 (older)",
@@ -1631,21 +1854,38 @@ def home():
             "current_pollutants": "Real-time from today only, calibrated to satellite-equivalent",
             "timestamps_included": "Yes - shows when measurements were taken",
             "calibration_note": "Ground measurements multiplied by calibration factors to match satellite data"
+        },
+        "visualizations": {
+            "training_history": "Loss and MAE curves",
+            "predictions_vs_actual": "Scatter plots with R² scores",
+            "error_distribution": "Histogram of prediction errors",
+            "residuals": "Residual plots for each pollutant",
+            "time_series": "Actual vs Predicted over time",
+            "metrics_summary": "Bar charts of MAE, RMSE, R², MAPE"
         }
     })
 
 # --- Run Flask App ---
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("🌍 Air Quality API with LSTM Predictions (GEE + OpenAQ + MongoDB)")
+    print("🌍 Air Quality API with LSTM Predictions & Visualizations")
     print("="*70)
     print(f"GEE Status: {'✅ Available' if GEE_AVAILABLE else '❌ Not Available'}")
     print(f"OpenAQ Status: ✅ Available")
     print(f"Database: MongoDB Atlas")
     print(f"Calibration: ✅ ENABLED")
+    print(f"Visualizations: ✅ ENABLED")
+    print(f"Plots Directory: {PLOTS_DIR}/")
     print(f"\n🔧 CALIBRATION FACTORS (Ground → Satellite):")
     for pollutant, factor in CALIBRATION_FACTORS.items():
         print(f"   • {pollutant.upper()}: {factor:.2f}")
+    print(f"\n📊 VISUALIZATION PLOTS:")
+    print(f"   • Training History (Loss & MAE curves)")
+    print(f"   • Predictions vs Actual (Scatter plots with R²)")
+    print(f"   • Error Distribution (Histograms)")
+    print(f"   • Residual Plots (Error vs Predicted)")
+    print(f"   • Time Series Comparison (Actual vs Predicted)")
+    print(f"   • Metrics Summary (MAE, RMSE, R², MAPE)")
     print(f"\n📈 CONFIGURATION:")
     print(f"   • Satellite Data Lag: {DATA_LAG_DAYS} days")
     print(f"   • MERRA-2 Data Lag: {MERRA_LAG_DAYS} days (2-4 weeks)")
@@ -1664,11 +1904,12 @@ if __name__ == "__main__":
     print(f"   • Prediction Start: TOMORROW (Day +1 from today)")
     print(f"   • Prediction End: 7 days from today (Day +7)")
     print(f"   • Training uses: OpenAQ + GEE integrated data")
-    print(f"\n✅ IMPROVEMENTS:")
+    print(f"\n✅ FEATURES:")
     print(f"   • Date filtering: Only fetches TODAY's OpenAQ measurements")
     print(f"   • Timestamp tracking: Shows when each measurement was taken")
     print(f"   • Data freshness: Includes measurement count and latest timestamp")
     print(f"   • **CALIBRATION: Ground values converted to satellite-equivalent**")
     print(f"   • Consistency: Current, historical, and predictions all use same scale")
+    print(f"   • **VISUALIZATIONS: Comprehensive plots for model evaluation**")
     print("="*70 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
