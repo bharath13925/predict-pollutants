@@ -10,3 +10,5 @@ dotenv
 pymongo[srv]
 dnspython
 openaq
+matplotlib
+seaborn
